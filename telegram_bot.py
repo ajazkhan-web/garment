@@ -250,6 +250,131 @@ class OpenRouterClient:
         return parsed
 
 
+
+# ====================================================================
+# GEMINI CLIENT — FREE TIER MULTIMODAL EXTRACTION (Google AI)
+# ====================================================================
+
+class GeminiClient:
+    """Handles multimodal LLM calls to Google Gemini for measurement + style
+    parsing. Uses the free tier — no credits needed. Same interface as
+    OpenRouterClient so they're interchangeable."""
+
+    def __init__(self):
+        self.api_key = config.GOOGLE_API_KEY
+        self.model = config.GEMINI_MODEL
+        self.base_url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent"
+        self.timeout = 90.0
+
+    async def _call(self, system_prompt: str, user_parts: list) -> str:
+        """Call Gemini generateContent API. user_parts = list of part dicts."""
+        payload = {
+            "contents": [{
+                "role": "user",
+                "parts": [{"text": system_prompt}] + user_parts,
+            }],
+            "generationConfig": {
+                "maxOutputTokens": 2000,
+                "temperature": 0.05,
+            },
+        }
+        url = f"{self.base_url}?key={self.api_key}"
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            resp = await client.post(url, json=payload, headers={"Content-Type": "application/json"})
+            if resp.status_code == 403:
+                logger.error(f"Gemini 403 Forbidden: {resp.text[:300]}")
+                raise RuntimeError(
+                    "Google API key rejected. Make sure the Generative Language API is enabled "
+                    "in Google Cloud Console and the key has access."
+                )
+            if resp.status_code == 429:
+                logger.error(f"Gemini rate limited (429): {resp.text[:300]}")
+                raise RuntimeError(
+                    "Gemini free-tier rate limit reached. Wait a minute and try again, "
+                    "or set OPENROUTER_API_KEY as a fallback."
+                )
+            if resp.status_code >= 400:
+                logger.error(f"Gemini HTTP {resp.status_code}: {resp.text[:500]}")
+            resp.raise_for_status()
+            data = resp.json()
+        # Extract text from Gemini response
+        candidates = data.get("candidates", [])
+        if not candidates:
+            raise ValueError("Gemini returned no candidates. The image may be too large or unclear.")
+        parts = candidates[0].get("content", {}).get("parts", [])
+        text = "".join(p.get("text", "") for p in parts)
+        if not text:
+            raise ValueError("Gemini returned empty response.")
+        return text
+
+    @staticmethod
+    def _strip_fences(content: str) -> str:
+        content = content.strip()
+        if content.startswith("```"):
+            content = content.split("```", 2)[1] if content.count("```") >= 2 else content.strip("`")
+            if content.startswith("json"):
+                content = content[4:]
+            content = content.strip()
+        return content
+
+    async def parse_measurement_sheet(self, image_bytes: bytes,
+                                       mime_type: str = "image/jpeg",
+                                       user_hint: str = "") -> dict:
+        """Send an uploaded measurement sheet image to Gemini for parsing.
+        Returns the FULL parsed dict — never static/hardcoded."""
+        import base64
+        b64_image = base64.b64encode(image_bytes).decode("utf-8")
+
+        system_prompt = (
+            "You are an expert apparel pattern maker and technical designer with "
+            "20+ years drafting production tech packs. You analyse measurement "
+            "sheets, size specification charts, and technical flat/CAD drafting "
+            "references, extracting EVERY detail precisely from the actual image "
+            "provided — you never fall back to a generic or previously-seen example.\n\n"
+            + EXTRACTION_SCHEMA_HINT
+        )
+
+        user_parts = [
+            {"text": f"Extract all measurements and styling details from this sheet. {user_hint}"},
+            {"inline_data": {"mime_type": mime_type, "data": b64_image}},
+        ]
+
+        content = await self._call(system_prompt, user_parts)
+        raw_content = content
+        content = self._strip_fences(content)
+        try:
+            parsed = json.loads(content)
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse Gemini JSON. Raw response: {raw_content[:1000]}")
+            raise ValueError(
+                "The AI could not return structured data for this image. "
+                "Try a clearer / higher-resolution photo of the sheet."
+            ) from e
+        return parsed
+
+    async def parse_text_measurements(self, text: str) -> dict:
+        """Parse measurements + styling from a typed text message."""
+        system_prompt = (
+            "You are an expert apparel pattern maker. Extract body measurements "
+            "and styling details from the user's text message, in centimetres.\n\n"
+            + EXTRACTION_SCHEMA_HINT
+        )
+        user_parts = [{"text": text}]
+
+        content = await self._call(system_prompt, user_parts)
+        raw_content = content
+        content = self._strip_fences(content)
+        try:
+            parsed = json.loads(content)
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse Gemini text JSON. Raw: {raw_content[:1000]}")
+            raise ValueError(
+                "The AI could not extract structured measurements from that text. "
+                "Try including specific numbers, e.g. 'bust 92cm, waist 72cm, hip 96cm'."
+            ) from e
+        return parsed
+
+
 # ====================================================================
 # SESSION STATE (per-user)
 # ====================================================================
@@ -277,7 +402,13 @@ class SessionState:
 
 
 user_sessions: dict[int, SessionState] = {}
-openrouter = OpenRouterClient()
+# ─── AI Client: Gemini (free) if key set, else OpenRouter (paid) ───
+if config.USE_GEMINI:
+    ai_client = GeminiClient()
+    logger.info("Using Google Gemini (free tier) for multimodal extraction.")
+else:
+    ai_client = OpenRouterClient()
+    logger.info("Using OpenRouter (Claude Sonnet 4) for multimodal extraction.")
 template_db = TemplateDB()
 
 
@@ -666,7 +797,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         image_bytes, mime = await _download_telegram_file(context.bot, photo.file_id)
-        result = await openrouter.parse_measurement_sheet(image_bytes, mime)
+        result = await ai_client.parse_measurement_sheet(image_bytes, mime)
         _apply_parsed_result(session, result)
         await update.message.reply_text(_format_measurement_report(session))
     except Exception as e:
@@ -709,7 +840,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("📸 Analysing your measurement sheet with AI vision...")
         try:
             file_bytes, mime = await _download_telegram_file(context.bot, doc.file_id)
-            result = await openrouter.parse_measurement_sheet(file_bytes, mime)
+            result = await ai_client.parse_measurement_sheet(file_bytes, mime)
             _apply_parsed_result(session, result)
             await update.message.reply_text(_format_measurement_report(session))
         except Exception as e:
@@ -730,7 +861,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if any(kw in text.lower() for kw in measurement_keywords):
         await update.message.reply_text("📝 Parsing measurements...")
         try:
-            result = await openrouter.parse_text_measurements(text)
+            result = await ai_client.parse_text_measurements(text)
             _apply_parsed_result(session, result)
             await update.message.reply_text(_format_measurement_report(session))
         except Exception as e:
