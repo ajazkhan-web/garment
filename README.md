@@ -33,7 +33,8 @@ A professional Telegram bot that converts measurement sheet photos into producti
 ### Prerequisites
 
 1. **Telegram Bot Token** — Create a bot via [@BotFather](https://t.me/BotFather)
-2. **OpenRouter API Key** — Get one at [openrouter.ai](https://openrouter.ai/keys)
+2. **Google API Key** (free) — Get one at [Google AI Studio](https://aistudio.google.com/apikey). The free tier includes multimodal vision.
+3. **OpenRouter API Key** (optional fallback) — Get one at [openrouter.ai](https://openrouter.ai/keys)
 3. **Render Account** — Sign up at [render.com](https://render.com)
 4. **GitHub Repo** — Fork or clone `ajazkhan-web/garment`
 
@@ -44,7 +45,8 @@ Go to your repo → Settings → Secrets and variables → Actions → New repos
 | Secret Name | Description |
 |---|---|
 | `TELEGRAM_BOT_TOKEN` | Your Telegram bot token from BotFather |
-| `OPENROUTER_API_KEY` | Your OpenRouter API key |
+| `GOOGLE_API_KEY` | Your Google API key (free, primary engine) |
+| `OPENROUTER_API_KEY` | Your OpenRouter API key (optional fallback) |
 | `RENDER_DEPLOY_HOOK_URL` | Deploy hook URL from Render (Step 3) |
 | `TELEGRAM_CHAT_ID` | Your Telegram chat ID (for deploy notifications) |
 
@@ -62,7 +64,8 @@ To get your chat ID: send any message to [@userinfobot](https://t.me/userinfobot
    - **Start Command**: `python telegram_bot.py`
 4. Add Environment Variables:
    - `TELEGRAM_BOT_TOKEN` = your token
-   - `OPENROUTER_API_KEY` = your key
+   - `GOOGLE_API_KEY` = your Google API key (free, primary)
+   - `OPENROUTER_API_KEY` = your OpenRouter key (optional fallback)
    - `BOT_MODE` = `polling`
 5. Click **Create Background Worker**
 
@@ -102,7 +105,8 @@ Now every `git push` to `main` will:
 ## Tech Stack
 
 - **python-telegram-bot** 21.6 — Telegram Bot API
-- **OpenRouter** (Claude Sonnet 4) — Multimodal measurement extraction
+- **Google Gemini 2.5 Flash** (free tier) — Multimodal measurement extraction (primary)
+- **OpenRouter** (Claude Sonnet 4) — Fallback extraction (optional, paid)
 - **ezdxf** 1.4.4 — DXF file generation with AAMA layers
 - **matplotlib** — 2D blueprint rendering (optional)
 - **Pillow** — Image processing (optional)
