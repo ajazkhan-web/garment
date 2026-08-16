@@ -150,7 +150,7 @@ class GeminiClient:
         self.api_key = config.GOOGLE_API_KEY
         self.model = config.GEMINI_MODEL
         self.base_url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent"
-        self.timeout = 90.0
+        self.timeout = 120.0
 
     async def _call(self, system_prompt: str, user_parts: list) -> str:
         """Call Gemini generateContent API. user_parts = list of part dicts."""
@@ -225,17 +225,31 @@ class GeminiClient:
             {"inline_data": {"mime_type": mime_type, "data": b64_image}},
         ]
 
-        content = await self._call(system_prompt, user_parts)
-        raw_content = content
-        content = self._strip_fences(content)
-        try:
-            parsed = json.loads(content)
-        except json.JSONDecodeError as e:
-            logger.error(f"Failed to parse Gemini JSON. Raw response: {raw_content[:1000]}")
-            raise ValueError(
-                "The AI could not return structured data for this image. "
-                "Try a clearer / higher-resolution photo of the sheet."
-            ) from e
+        # Retry up to 2 times if critical measurements come back as 0
+        for attempt in range(3):
+            content = await self._call(system_prompt, user_parts)
+            raw_content = content
+            content = self._strip_fences(content)
+            try:
+                parsed = json.loads(content)
+            except json.JSONDecodeError as e:
+                logger.error(f"Failed to parse Gemini JSON (attempt {attempt+1}). Raw: {raw_content[:500]}")
+                if attempt < 2:
+                    logger.info("Retrying parse...")
+                    continue
+                raise ValueError(
+                    "The AI could not return structured data for this image. "
+                    "Try a clearer / higher-resolution photo of the sheet."
+                ) from e
+
+            meas = parsed.get("measurements", {})
+            critical_zeros = sum(1 for k in ("bust", "waist", "hip") if not meas.get(k))
+            if critical_zeros < 2 or attempt == 2:
+                if critical_zeros >= 2:
+                    logger.warning(f"Critical measurements still missing after {attempt+1} attempts")
+                return parsed
+            logger.warning(f"Attempt {attempt+1}: {critical_zeros} critical fields are 0 — retrying...")
+
         return parsed
 
     async def parse_text_measurements(self, text: str) -> dict:
