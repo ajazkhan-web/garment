@@ -41,7 +41,7 @@ for _k in _KEY_CANDIDATES:
 # token budget on invisible reasoning tokens.
 GEMINI_MODEL = "gemini-flash-latest"
 GEMINI_VISION_MODEL = "gemini-flash-latest"
-GEMINI_THINKING_BUDGET = 0   # disable extended thinking — direct answers only
+GEMINI_THINKING_BUDGET = 256  # small budget: enough to read the chart accurately
 
 # Strict enforcement: Gemini is the sole AI provider. No fallback.
 DEFAULT_AI_PROVIDER = "gemini"
