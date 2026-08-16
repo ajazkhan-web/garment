@@ -2,7 +2,7 @@
 telegram_bot.py — AI-Powered Apparel Pattern Drafting Telegram Bot (v2)
 ==========================================================================
 Accepts measurement sheets / tech packs via Telegram, parses them with
-OpenRouter's multimodal LLM (extracting exact measurements AND styling
+Google Gemini's multimodal vision API (extracting exact measurements AND styling
 details — cowl, gathers, pleats, asymmetric hems, drop shoulder, etc.),
 drafts 2D CAD patterns with true curve interpolation, and delivers both
 an industry-standard DXF/AAMA file and a labelled blueprint preview PNG.
@@ -65,7 +65,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ====================================================================
-# OPENROUTER CLIENT — TRUE DYNAMIC MULTIMODAL EXTRACTION
+# GOOGLE CLIENT — TRUE DYNAMIC MULTIMODAL EXTRACTION
 # ====================================================================
 
 EXTRACTION_SCHEMA_HINT = """Return ONLY a JSON object with this exact shape (no markdown fences, no commentary):
@@ -134,120 +134,6 @@ CRITICAL RULES:
 - Output must be valid JSON only."""
 
 
-class OpenRouterClient:
-    """Handles multimodal LLM calls to OpenRouter for measurement + style
-    parsing. No static fallback — failures raise and are surfaced to the user."""
-
-    def __init__(self):
-        self.api_key = config.OPENROUTER_API_KEY
-        self.base_url = config.OPENROUTER_BASE_URL
-        self.model = config.OPENROUTER_MODEL
-        self.timeout = 90.0
-
-    def _headers(self) -> dict:
-        return {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-            "HTTP-Referer": "https://github.com/ajazkhan-web/garment",
-            "X-Title": "Apparel Pattern Drafting Bot",
-        }
-
-    async def _call(self, messages: list) -> str:
-        payload = {
-            "model": self.model,
-            "messages": messages,
-            "max_tokens": 2000,
-            "temperature": 0.05,
-        }
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            resp = await client.post(self.base_url, json=payload, headers=self._headers())
-            if resp.status_code == 402:
-                logger.error(f"OpenRouter credits exhausted (402): {resp.text[:300]}")
-                raise RuntimeError(
-                    "OpenRouter credits exhausted. Add credits at https://openrouter.ai/settings/credits to resume image parsing."
-                )
-            if resp.status_code >= 400:
-                logger.error(f"OpenRouter HTTP {resp.status_code}: {resp.text[:500]}")
-            resp.raise_for_status()
-            data = resp.json()
-        return data["choices"][0]["message"]["content"]
-
-    @staticmethod
-    def _strip_fences(content: str) -> str:
-        content = content.strip()
-        if content.startswith("```"):
-            content = content.split("```", 2)[1] if content.count("```") >= 2 else content.strip("`")
-            if content.startswith("json"):
-                content = content[4:]
-            content = content.strip()
-        return content
-
-    async def parse_measurement_sheet(self, image_bytes: bytes,
-                                       mime_type: str = "image/jpeg",
-                                       user_hint: str = "") -> dict:
-        """Send an uploaded measurement sheet / tech pack image to OpenRouter
-        with a structured extraction prompt. Returns the FULL parsed dict —
-        never a static/hardcoded result."""
-        import base64
-        b64_image = base64.b64encode(image_bytes).decode("utf-8")
-        data_url = f"data:{mime_type};base64,{b64_image}"
-
-        system_prompt = (
-            "You are an expert apparel pattern maker and technical designer with "
-            "20+ years drafting production tech packs. You analyse measurement "
-            "sheets, size specification charts, and technical flat/CAD drafting "
-            "references, extracting EVERY detail precisely from the actual image "
-            "provided — you never fall back to a generic or previously-seen example.\n\n"
-            + EXTRACTION_SCHEMA_HINT
-        )
-
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": f"Extract all measurements and styling details from this sheet. {user_hint}"},
-                    {"type": "image_url", "image_url": {"url": data_url}},
-                ],
-            },
-        ]
-
-        content = await self._call(messages)
-        raw_content = content
-        content = self._strip_fences(content)
-        try:
-            parsed = json.loads(content)
-        except json.JSONDecodeError as e:
-            logger.error(f"Failed to parse LLM JSON. Raw response: {raw_content[:1000]}")
-            raise ValueError(
-                "The AI could not return structured data for this image. "
-                "Try a clearer / higher-resolution photo of the sheet."
-            ) from e
-        return parsed
-
-    async def parse_text_measurements(self, text: str) -> dict:
-        """Parse measurements + styling from a typed text message."""
-        system_prompt = (
-            "You are an expert apparel pattern maker. Extract body measurements "
-            "and styling details from the user's text message, in centimetres.\n\n"
-            + EXTRACTION_SCHEMA_HINT
-        )
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": text},
-        ]
-        content = await self._call(messages)
-        raw_content = content
-        content = self._strip_fences(content)
-        try:
-            parsed = json.loads(content)
-        except json.JSONDecodeError as e:
-            logger.error(f"Failed to parse text LLM JSON. Raw response: {raw_content[:1000]}")
-            raise ValueError(
-                "The AI could not extract structured measurements from that text. "
-                "Try including specific numbers, e.g. 'bust 92cm, waist 72cm, hip 96cm'."
-            ) from e
-        return parsed
 
 
 
@@ -256,9 +142,9 @@ class OpenRouterClient:
 # ====================================================================
 
 class GeminiClient:
-    """Handles multimodal LLM calls to Google Gemini for measurement + style
-    parsing. Uses the free tier — no credits needed. Same interface as
-    OpenRouterClient so they're interchangeable."""
+    """Sole AI engine — Google Gemini for multimodal measurement + style parsing.
+    Uses the free tier (no credits needed). If Gemini fails, the exact error
+    is surfaced to the user — no fallback to any other provider."""
 
     def __init__(self):
         self.api_key = config.GOOGLE_API_KEY
@@ -284,14 +170,13 @@ class GeminiClient:
             if resp.status_code == 403:
                 logger.error(f"Gemini 403 Forbidden: {resp.text[:300]}")
                 raise RuntimeError(
-                    "Google API key rejected. Make sure the Generative Language API is enabled "
-                    "in Google Cloud Console and the key has access."
+                    "Google API key rejected (403 Forbidden). Ensure the Generative Language API is enabled "
+                    "in Google Cloud Console and your API key has access."
                 )
             if resp.status_code == 429:
                 logger.error(f"Gemini rate limited (429): {resp.text[:300]}")
                 raise RuntimeError(
-                    "Gemini free-tier rate limit reached. Wait a minute and try again, "
-                    "or set OPENROUTER_API_KEY as a fallback."
+                    "Gemini free-tier rate limit reached (429). Wait a minute and try again."
                 )
             if resp.status_code >= 400:
                 logger.error(f"Gemini HTTP {resp.status_code}: {resp.text[:500]}")
@@ -402,93 +287,17 @@ class SessionState:
 
 
 user_sessions: dict[int, SessionState] = {}
-# ─── Unified AI Client: Gemini (primary) → OpenRouter (fallback) ───
+# ─── AI Client: Google Gemini ONLY (no Gemini fallback) ───
 
-class UnifiedAIClient:
-    """Tries Google Gemini first (free tier). If Gemini fails at runtime
-    (network error, 403, 429, etc.) AND OpenRouter is configured, falls
-    back to OpenRouter. Never silently defaults to OpenRouter — Gemini
-    is always attempted first."""
-
-    def __init__(self):
-        self._gemini = None
-        self._openrouter = None
-        self._gemini_available = bool(config.GOOGLE_API_KEY)
-        self._openrouter_available = bool(getattr(config, "OPENROUTER_API_KEY", ""))
-
-        if self._gemini_available:
-            self._gemini = GeminiClient()
-            logger.info("🟢 Primary AI: Google Gemini (free tier) — GOOGLE_API_KEY detected")
-        else:
-            logger.warning("⚠️  GOOGLE_API_KEY not set in environment — Gemini unavailable. "
-                           "Set GOOGLE_API_KEY to enable free-tier parsing.")
-
-        if self._openrouter_available:
-            self._openrouter = OpenRouterClient()
-            logger.info("🔵 Fallback AI: OpenRouter (Claude Sonnet 4) — available as backup")
-        else:
-            logger.info("🔵 OpenRouter not configured — no fallback available")
-
-        if not self._gemini_available and not self._openrouter_available:
-            logger.error("❌ CRITICAL: No AI provider configured! "
-                         "Set GOOGLE_API_KEY (free) or OPENROUTER_API_KEY (paid).")
-
-    @property
-    def provider_name(self) -> str:
-        if self._gemini_available:
-            return "Google Gemini"
-        elif self._openrouter_available:
-            return "OpenRouter (fallback)"
-        return "NONE"
-
-    async def parse_measurement_sheet(self, image_bytes, mime_type="image/jpeg", user_hint=""):
-        # Try Gemini first
-        if self._gemini_available:
-            try:
-                logger.info("🔄 Attempting image parse with Google Gemini...")
-                result = await self._gemini.parse_measurement_sheet(image_bytes, mime_type, user_hint)
-                logger.info("✅ Gemini parse succeeded")
-                return result
-            except Exception as gemini_err:
-                logger.error(f"❌ Gemini parse failed: {gemini_err}")
-                if not self._openrouter_available:
-                    raise  # No fallback — re-raise the Gemini error
-                logger.warning("⚠️  Falling back to OpenRouter for image parsing...")
-
-        # Fallback to OpenRouter
-        if self._openrouter_available:
-            logger.info("🔄 Attempting image parse with OpenRouter (fallback)...")
-            return await self._openrouter.parse_measurement_sheet(image_bytes, mime_type, user_hint)
-
-        raise RuntimeError(
-            "No AI provider available. Set GOOGLE_API_KEY (free, recommended) "
-            "or OPENROUTER_API_KEY (paid fallback) in your environment."
-        )
-
-    async def parse_text_measurements(self, text):
-        if self._gemini_available:
-            try:
-                logger.info("🔄 Attempting text parse with Google Gemini...")
-                result = await self._gemini.parse_text_measurements(text)
-                logger.info("✅ Gemini text parse succeeded")
-                return result
-            except Exception as gemini_err:
-                logger.error(f"❌ Gemini text parse failed: {gemini_err}")
-                if not self._openrouter_available:
-                    raise
-                logger.warning("⚠️  Falling back to OpenRouter for text parsing...")
-
-        if self._openrouter_available:
-            logger.info("🔄 Attempting text parse with OpenRouter (fallback)...")
-            return await self._openrouter.parse_text_measurements(text)
-
-        raise RuntimeError(
-            "No AI provider available. Set GOOGLE_API_KEY (free, recommended) "
-            "or OPENROUTER_API_KEY (paid fallback) in your environment."
-        )
-
-ai_client = UnifiedAIClient()
-logger.info(f"AI Provider: {ai_client.provider_name}")
+if not config.GOOGLE_API_KEY:
+    logger.error("❌ CRITICAL: GOOGLE_API_KEY is not set! The bot cannot parse images without it.")
+    logger.error("   Set GOOGLE_API_KEY in your environment (Render dashboard -> Environment).")
+    ai_client = None
+else:
+    ai_client = GeminiClient()
+    logger.info("AI Provider: Google Gemini (sole engine, no fallback)")
+    logger.info(f"   Model: {config.GEMINI_MODEL}")
+    logger.info(f"   API Key: {config.GOOGLE_API_KEY[:8]}...{config.GOOGLE_API_KEY[-4:]}")
 template_db = TemplateDB()
 
 
@@ -908,7 +717,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Photo processing failed: {e}", exc_info=True)
         await update.message.reply_text(
-            f"❌ Failed to parse the image: {e}\n\nTry uploading a clearer/higher-res photo, or type measurements as text."
+            f"❌ Gemini AI Error:\n\n{e}\n\nPlease check:\n• GOOGLE_API_KEY is set in Render environment\n• Generative Language API is enabled in Google Cloud Console\n• You have not hit the free-tier rate limit\n\nOr type measurements as text."
         )
 
 
@@ -950,7 +759,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(_format_measurement_report(session))
         except Exception as e:
             logger.error(f"Document image processing failed: {e}", exc_info=True)
-            await update.message.reply_text(f"❌ Failed to parse: {e}")
+            await update.message.reply_text(f"❌ Gemini AI Error:\n\n{e}")
     else:
         await update.message.reply_text(
             f"Unsupported file type: {ext}\nSupported: .PDS, .DXF, .PLT (templates), .JPG/.PNG (measurement sheets)"
@@ -972,7 +781,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.error(f"Text parsing failed: {e}", exc_info=True)
             await update.message.reply_text(
-                f"❌ Failed to parse measurements: {e}\n\nTry format: bust 92, waist 72, hip 96, dress length 100"
+                f"❌ Gemini AI Error:\n\n{e}\n\nTry format: bust 92, waist 72, hip 96, dress length 100"
             )
     else:
         await update.message.reply_text(
@@ -1019,8 +828,8 @@ def build_app() -> Application:
 def main():
     if not config.TELEGRAM_BOT_TOKEN:
         raise RuntimeError("TELEGRAM_BOT_TOKEN not set in environment.")
-    if not config.OPENROUTER_API_KEY:
-        logger.warning("OPENROUTER_API_KEY not set — LLM parsing will fail.")
+    if not config.GOOGLE_API_KEY:
+        logger.warning("GOOGLE_API_KEY not set — LLM parsing will fail.")
 
     app = build_app()
     mode = config.BOT_MODE.lower()
