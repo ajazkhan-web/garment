@@ -1,68 +1,85 @@
 """
-generator.py — Universal 2D Apparel Pattern Drafting Engine (v2)
-==================================================================
-Generates professional CAD pattern pieces from body measurements AND
-parsed styling details (cowl, gathers, pleats, asymmetric hems, drop
-shoulder) using standard apparel drafting formulas plus true curve
-interpolation (cubic Bezier) for armholes, necklines and sleeve caps.
+generator.py — Core apparel pattern drafting engine.
 
-Exports DXF / AAMA files compatible with Optitex, Gerber, and Lectra
-via ezdxf, and a labelled 2D blueprint preview PNG via blueprint.py.
+This module provides a complete, measurement-driven pattern drafting system
+for an apparel pattern drafting Telegram bot. It computes bodice, sleeve,
+skirt, collar, cowl, and facing pattern pieces from body measurements and
+style details, then exports them to DXF (AAMA-compliant) using ezdxf.
 
-Garment types supported:
-    dress, kurti, bodice, skirt, shirt, sleeve
-    + dynamic style overlays: cowl / wrap, gathers, pleats,
-      asymmetric hem, drop shoulder
+All coordinates are in centimetres.  Origin (0, 0) is:
+    - centre-front-neck for bodice pieces (front faces right, back faces left)
+    - centre-top for sleeves (grainline vertical)
 
-Author: EJAJ KHAN
+Every pattern piece is computed from actual measurements — no hardcoded
+static patterns.  If an unknown garment type is requested, a basic bodice
+block is drafted.
 """
-from __future__ import annotations
 
-import math
-import json
-import sqlite3
-import hashlib
-import os
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 from typing import Optional
-from datetime import datetime
+import math
 
-import ezdxf
 
-try:
-    import config
-except ImportError:  # standalone import fallback
-    class _C:
-        OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
-        CACHE_DIR = os.path.join(os.getcwd(), "cache")
-        TEMPLATE_DIR = os.path.join(os.getcwd(), "templates")
-        OUTPUT_DIR = os.path.join(os.getcwd(), "output")
-        DATABASE_PATH = os.path.join(os.getcwd(), "data", "templates.db")
-        SEAM_ALLOWANCE = 1.0
-        HEM_ALLOWANCE = 2.5
-        AAMA_LAYERS = {
-            "CUT": "1", "SEAM": "8", "GRAIN": "4", "NOTCH": "3",
-            "INTERNAL": "4", "REFERENCE": "6", "ANNOTATION": "7", "MIRROR": "9",
-        }
-        EASE_BODICE = {"minimal": 2.0, "standard": 4.0, "loose": 6.0}
-        EASE_SKIRT = {"minimal": 2.0, "standard": 3.0, "loose": 5.0}
-    config = _C()
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
 
-# ====================================================================
-# DATA STRUCTURES
-# ====================================================================
+SEAM_ALLOWANCE = 1.0      # cm
+HEM_ALLOWANCE = 2.5       # cm
+
+EASE_VALUES = {
+    "minimal": 2.0,
+    "standard": 4.0,
+    "loose": 8.0,
+    "none": 0.0,
+    "fitted": 1.0,
+    "comfort": 6.0,
+}
+
+# AAMA layer names and DXF colours
+LAYER_CUT = "1"
+LAYER_SEAM = "8"
+LAYER_GRAIN = "4"
+LAYER_NOTCH = "3"
+LAYER_INTERNAL = "4"
+LAYER_REFERENCE = "6"
+LAYER_ANNOTATION = "7"
+LAYER_MIRROR = "9"
+
+AAMA_LAYERS = {
+    LAYER_CUT:        {"color": 1,   "name": "1"},
+    LAYER_SEAM:       {"color": 8,   "name": "8"},
+    LAYER_GRAIN:      {"color": 4,   "name": "4"},
+    LAYER_NOTCH:      {"color": 3,   "name": "3"},
+    LAYER_INTERNAL:   {"color": 4,   "name": "4"},
+    LAYER_REFERENCE:  {"color": 6,   "name": "6"},
+    LAYER_ANNOTATION: {"color": 7,   "name": "7"},
+    LAYER_MIRROR:     {"color": 9,   "name": "9"},
+}
+
+# Garment types supported
+GARMENT_TYPES = [
+    "dress", "kurti", "top", "blouse", "shirt", "skirt",
+    "sleeve", "wrap", "bodice", "gown", "kaftan",
+]
+
+DEFAULT_BEZIER_SEGMENTS = 16
+
+
+# ---------------------------------------------------------------------------
+# Data structures
+# ---------------------------------------------------------------------------
 
 @dataclass
 class Measurements:
-    """Normalised body measurements in centimetres."""
     bust: float = 0.0
     waist: float = 0.0
     hip: float = 0.0
-    shoulder_width: float = 0.0       # across-shoulder
-    shoulder_length: float = 0.0      # neck-to-shoulder-tip
-    back_length: float = 0.0          # nape to waist (CB)
-    front_length: float = 0.0         # shoulder to waist (CF)
-    armhole_depth: float = 0.0        # scye depth
+    shoulder_width: float = 0.0
+    shoulder_length: float = 0.0
+    back_length: float = 0.0
+    front_length: float = 0.0
+    armhole_depth: float = 0.0
     neck_width: float = 0.0
     neck_depth_front: float = 0.0
     neck_depth_back: float = 0.0
@@ -72,47 +89,43 @@ class Measurements:
     skirt_length: float = 0.0
     dress_length: float = 0.0
     shoulder_to_bust: float = 0.0
-    bust_span: float = 0.0            # distance between bust points (apex)
-    waist_to_hip: float = 20.0        # typical 18-22cm
+    bust_span: float = 0.0
+    waist_to_hip: float = 20.0
     apex_to_apex: float = 0.0
-    shoulder_slope: float = 4.0       # cm drop from neck to shoulder tip
+    shoulder_slope: float = 4.0
     dart_intake_bust: float = 0.0
     dart_intake_waist_front: float = 0.0
     dart_intake_waist_back: float = 0.0
-    ease: str = "standard"            # minimal / standard / loose
+    ease: str = 'standard'
 
     def validate(self) -> bool:
-        required = ["bust", "waist", "hip"]
+        required = ['bust', 'waist', 'hip']
         return all(getattr(self, k, 0) > 0 for k in required)
 
     def missing_keys(self) -> list[str]:
-        return [k for k in
-                ("bust", "waist", "hip", "shoulder_width", "back_length")
+        return [k for k in ('bust', 'waist', 'hip', 'shoulder_width', 'back_length')
                 if getattr(self, k, 0) <= 0]
 
 
 @dataclass
 class StyleDetails:
-    """Parsed styling / silhouette details from the uploaded tech pack."""
-    silhouette: str = ""                     # e.g. "wrap", "A-line", "fitted"
+    silhouette: str = ''
     has_cowl: bool = False
     has_gathers: bool = False
-    gather_locations: list[str] = field(default_factory=list)   # e.g. ["front neckline", "shoulder"]
+    gather_locations: list = field(default_factory=list)
     has_pleats: bool = False
     pleat_count: int = 0
     asymmetric_hem: bool = False
     drop_shoulder: bool = False
     has_collar: bool = False
-    collar_type: str = ""
-    closure: str = ""                        # e.g. "wrap tie", "zip", "button"
-    size_label: str = ""
-    cut_quantities: dict = field(default_factory=dict)   # piece_name -> qty
-    measurements_table: dict = field(default_factory=dict)  # raw label->value as seen on sheet
-    notes: str = ""
-
-    def is_dynamic_front(self) -> bool:
-        """True if the front bodice needs the asymmetric/gathered drafting path."""
-        return self.has_cowl or self.has_gathers or self.asymmetric_hem
+    collar_type: str = ''
+    closure: str = ''
+    size_label: str = ''
+    cut_quantities: dict = field(default_factory=dict)
+    measurements_table: dict = field(default_factory=dict)
+    has_laces: bool = False
+    has_notches: bool = True
+    has_darts: bool = True
 
 
 @dataclass
@@ -120,1301 +133,1682 @@ class Point:
     x: float
     y: float
 
-    def to_tuple(self) -> tuple[float, float]:
+    def to_tuple(self):
         return (self.x, self.y)
 
-    def __add__(self, other: "Point") -> "Point":
-        return Point(self.x + other.x, self.y + other.y)
+    def __add__(self, o):
+        return Point(self.x + o.x, self.y + o.y)
 
-    def __sub__(self, other: "Point") -> "Point":
-        return Point(self.x - other.x, self.y - other.y)
+    def __sub__(self, o):
+        return Point(self.x - o.x, self.y - o.y)
+
+    def __mul__(self, s):
+        return Point(self.x * s, self.y * s)
+
+    def __rmul__(self, s):
+        return Point(self.x * s, self.y * s)
+
+    def distance_to(self, o):
+        return _dist(self, o)
+
+
+@dataclass
+class Dart:
+    start: Point
+    end: Point
+    width: float = 2.0
+
+
+@dataclass
+class Notch:
+    point: Point
+    depth: float = 0.3
+    angle: float = 90.0
 
 
 @dataclass
 class PatternPiece:
-    """A single pattern piece (e.g. front bodice, back sleeve)."""
     name: str
-    piece_type: str            # "front" | "back" | "sleeve" | "collar" | "facing" | "other"
-    outline: list[Point] = field(default_factory=list)      # main cutting line vertices
-    outline_curves: dict = field(default_factory=dict)       # {seg_index: [Point,...]} bezier fill-in between outline[i] and outline[i+1]
-    seam_line: list[Point] = field(default_factory=list)     # stitching line (inside SA)
-    darts: list[dict] = field(default_factory=list)          # each: {start, end, apex}
-    notches: list[Point] = field(default_factory=list)
-    grainline: Optional[dict] = None                          # {start, end, direction}
-    internal_lines: list[dict] = field(default_factory=list)
-    fold_lines: list[dict] = field(default_factory=list)      # {points: [Point,Point], label}
-    gather_guides: list[dict] = field(default_factory=list)   # {points:[Point,Point], label:"GATHER"}
-    pleat_guides: list[dict] = field(default_factory=list)    # {points:[Point,Point], label:"PLEAT FOLD"}
-    annotations: list[dict] = field(default_factory=list)     # {pos, text}
-    mirror_axis: Optional[dict] = None                        # {start, end}
-    cut_qty: int = 1
-    meta: dict = field(default_factory=dict)
+    points: list          # list of Point objects (outline)
+    curves: list          # list of dicts {"start_idx", "end_idx", "control_points", "type"}
+    darts: list           # list of Dart
+    notches: list         # list of Notch
+    grainline: list       # [Point, Point]
+    label: str = ''
+    cut_quantity: int = 1
+    layer: str = '1'
+
+    def to_dict(self) -> dict:
+        return {
+            'name': self.name,
+            'points': [p.to_tuple() for p in self.points],
+            'curves': [
+                {
+                    'start_idx': c.get('start_idx', 0),
+                    'end_idx': c.get('end_idx', 0),
+                    'type': c.get('type', 'bezier'),
+                }
+                for c in self.curves
+            ],
+            'darts': [
+                {'start': d.start.to_tuple(), 'end': d.end.to_tuple(), 'width': d.width}
+                for d in self.darts
+            ],
+            'notches': [
+                {'point': n.point.to_tuple(), 'depth': n.depth, 'angle': n.angle}
+                for n in self.notches
+            ],
+            'grainline': [g.to_tuple() for g in self.grainline],
+            'label': self.label,
+            'cut_quantity': self.cut_quantity,
+            'layer': self.layer,
+        }
 
 
-# ====================================================================
-# MATH HELPERS
-# ====================================================================
+# ---------------------------------------------------------------------------
+# Helper functions
+# ---------------------------------------------------------------------------
 
 def _dist(p1: Point, p2: Point) -> float:
+    """Euclidean distance between two points."""
     return math.hypot(p2.x - p1.x, p2.y - p1.y)
 
+
 def _midpoint(p1: Point, p2: Point) -> Point:
-    return Point((p1.x + p2.x) / 2, (p1.y + p2.y) / 2)
+    """Midpoint between two points."""
+    return Point((p1.x + p2.x) / 2.0, (p1.y + p2.y) / 2.0)
+
 
 def _polar(origin: Point, angle_deg: float, length: float) -> Point:
-    r = math.radians(angle_deg)
-    return Point(
-        origin.x + length * math.cos(r),
-        origin.y + length * math.sin(r),
-    )
+    """Point at *angle_deg* and *length* from *origin*.
+
+    Angle is measured in standard math convention (0 deg = +X, 90 deg = +Y).
+    """
+    rad = math.radians(angle_deg)
+    return Point(origin.x + length * math.cos(rad),
+                 origin.y + length * math.sin(rad))
+
 
 def _angle(p1: Point, p2: Point) -> float:
+    """Angle in degrees from p1 to p2."""
     return math.degrees(math.atan2(p2.y - p1.y, p2.x - p1.x))
 
-def _perp_point(p1: Point, p2: Point, offset: float, from_t: float = 0.5) -> Point:
-    """Return a point offset perpendicular to segment p1-p2 at parametric t."""
-    mid = Point(p1.x + (p2.x - p1.x) * from_t, p1.y + (p2.y - p1.y) * from_t)
-    a = _angle(p1, p2) + 90
-    return _polar(mid, a, offset)
 
-def _offset_polyline(points: list[Point], distance: float) -> list[Point]:
-    """Offset a polyline outward by *distance* (simple miter join)."""
+def _perp_point(p1: Point, p2: Point, offset: float) -> Point:
+    """Point offset perpendicular to the line p1->p2 by *offset* distance.
+
+    Positive offset is to the left of the direction p1->p2.
+    """
+    d = _dist(p1, p2)
+    if d == 0:
+        return Point(p1.x, p1.y)
+    dx = (p2.x - p1.x) / d
+    dy = (p2.y - p1.y) / d
+    nx = -dy
+    ny = dx
+    return Point(p1.x + nx * offset, p1.y + ny * offset)
+
+
+def _offset_polyline(points: list, distance: float) -> list:
+    """Offset a polyline by *distance* outward (to the left of traversal).
+
+    Returns a new list of Point objects.  Each vertex is shifted by the
+    average of the perpendiculars of its two adjacent edges.
+    """
     if len(points) < 2:
-        return list(points)
-    result: list[Point] = []
+        return [Point(p.x, p.y) for p in points]
+
+    result = []
     n = len(points)
     for i in range(n):
-        p_prev = points[i - 1] if i > 0 else points[0]
-        p_curr = points[i]
-        p_next = points[i + 1] if i < n - 1 else points[-1]
+        if i == 0:
+            p_prev = points[0]
+            p_curr = points[1]
+        elif i == n - 1:
+            p_prev = points[n - 2]
+            p_curr = points[n - 1]
+        else:
+            p_prev = points[i - 1]
+            p_curr = points[i]
 
-        a_in = _angle(p_prev, p_curr) if i > 0 else _angle(p_curr, p_next)
-        a_out = _angle(p_curr, p_next) if i < n - 1 else a_in
-        a_avg = (a_in + a_out) / 2
-
-        perp = a_avg + 90
-        result.append(_polar(p_curr, perp, distance))
+        d = _dist(p_prev, p_curr)
+        if d == 0:
+            result.append(Point(points[i].x, points[i].y))
+            continue
+        dx = (p_curr.x - p_prev.x) / d
+        dy = (p_curr.y - p_prev.y) / d
+        nx = -dy
+        ny = dx
+        result.append(Point(points[i].x + nx * distance,
+                            points[i].y + ny * distance))
     return result
 
 
-def _cubic_bezier(p0: Point, p1: Point, p2: Point, p3: Point, n: int = 16) -> list[Point]:
-    """Sample n interior points (excludes endpoints) along a cubic Bezier curve."""
+def _cubic_bezier(p0: Point, p1: Point, p2: Point, p3: Point,
+                  n: int = DEFAULT_BEZIER_SEGMENTS) -> list:
+    """Cubic Bezier curve from p0 to p3 with control points p1, p2.
+
+    Returns n+1 Point objects.
+    """
     pts = []
-    for i in range(1, n):
+    for i in range(n + 1):
         t = i / n
-        mt = 1 - t
-        x = (mt**3) * p0.x + 3 * (mt**2) * t * p1.x + 3 * mt * (t**2) * p2.x + (t**3) * p3.x
-        y = (mt**3) * p0.y + 3 * (mt**2) * t * p1.y + 3 * mt * (t**2) * p2.y + (t**3) * p3.y
+        mt = 1.0 - t
+        x = (mt**3 * p0.x + 3 * mt**2 * t * p1.x +
+             3 * mt * t**2 * p2.x + t**3 * p3.x)
+        y = (mt**3 * p0.y + 3 * mt**2 * t * p1.y +
+             3 * mt * t**2 * p2.y + t**3 * p3.y)
         pts.append(Point(x, y))
     return pts
 
 
-def _quadratic_bezier_curve(p0: Point, ctrl: Point, p2: Point, n: int = 12) -> list[Point]:
-    """Sample n interior points (excludes endpoints) along a quadratic Bezier curve."""
+def _quadratic_bezier(p0: Point, ctrl: Point, p2: Point,
+                      n: int = 12) -> list:
+    """Quadratic Bezier curve from p0 to p2 with control point *ctrl*.
+
+    Returns n+1 Point objects.
+    """
     pts = []
-    for i in range(1, n):
+    for i in range(n + 1):
         t = i / n
-        mt = 1 - t
-        x = (mt**2) * p0.x + 2 * mt * t * ctrl.x + (t**2) * p2.x
-        y = (mt**2) * p0.y + 2 * mt * t * ctrl.y + (t**2) * p2.y
+        mt = 1.0 - t
+        x = mt**2 * p0.x + 2 * mt * t * ctrl.x + t**2 * p2.x
+        y = mt**2 * p0.y + 2 * mt * t * ctrl.y + t**2 * p2.y
         pts.append(Point(x, y))
     return pts
 
 
-def _armhole_curve(shoulder_tip: Point, side_point: Point, depth_bulge: float, n: int = 14) -> list[Point]:
-    """Standard armhole curve using a quadratic Bezier control point bulged outward."""
+def _arc_points(center: Point, radius: float, start_angle: float,
+                end_angle: float, n: int = 16) -> list:
+    """Arc interpolation.  Angles in degrees.  Returns n+1 Point objects."""
+    pts = []
+    for i in range(n + 1):
+        t = i / n
+        ang = math.radians(start_angle + t * (end_angle - start_angle))
+        pts.append(Point(center.x + radius * math.cos(ang),
+                        center.y + radius * math.sin(ang)))
+    return pts
+
+
+def _armhole_curve(shoulder_tip: Point, side_point: Point,
+                   depth_bulge: float) -> list:
+    """Smooth armhole curve from shoulder tip down to side-seam point.
+
+    *depth_bulge* controls how far the curve bulges inward (toward body).
+    """
     mid = _midpoint(shoulder_tip, side_point)
-    a = _angle(shoulder_tip, side_point) + 90
-    ctrl = _polar(mid, a, depth_bulge)
-    return _quadratic_bezier_curve(shoulder_tip, ctrl, side_point, n)
+    ang = _angle(shoulder_tip, side_point)
+    inward = _polar(mid, ang + 90, depth_bulge)
+    return _quadratic_bezier(shoulder_tip, inward, side_point, n=20)
 
 
-def _neckline_curve(cf_point: Point, shoulder_point: Point, depth_bulge: float, n: int = 10) -> list[Point]:
-    """Neckline curve using a quadratic Bezier bulged inward (concave)."""
+def _neckline_curve(cf_point: Point, shoulder_point: Point,
+                    depth_bulge: float) -> list:
+    """Smooth neckline curve from centre-front point to shoulder-neck point.
+
+    *depth_bulge* controls how far the curve dips below the straight line.
+    """
     mid = _midpoint(cf_point, shoulder_point)
-    a = _angle(cf_point, shoulder_point) - 90
-    ctrl = _polar(mid, a, depth_bulge)
-    return _quadratic_bezier_curve(cf_point, ctrl, shoulder_point, n)
+    ang = _angle(cf_point, shoulder_point)
+    ctrl = _polar(mid, ang - 90, depth_bulge)
+    return _quadratic_bezier(cf_point, ctrl, shoulder_point, n=16)
 
 
-def _sleeve_cap_curve(p0: Point, p1: Point, p2: Point, p3: Point, n: int = 16) -> list[Point]:
-    """Sleeve cap curve — full cubic Bezier for the bell shape."""
-    return _cubic_bezier(p0, p1, p2, p3, n)
+def _sleeve_cap_curve(p0: Point, p1: Point, p2: Point, p3: Point) -> list:
+    """Sleeve cap curve — cubic Bezier through control points p1, p2."""
+    return _cubic_bezier(p0, p1, p2, p3, n=24)
 
 
-# ====================================================================
-# DRAFTING ENGINE — Block Computations
-# ====================================================================
+def _smooth_closed_curve(points: list, bulge: float = 0.3) -> list:
+    """Smooth a closed polyline by inserting quadratic Bezier arcs at each
+    vertex.  Returns a denser list of points.
+    """
+    if len(points) < 3:
+        return points
+    result = []
+    n = len(points)
+    for i in range(n):
+        prev = points[(i - 1) % n]
+        curr = points[i]
+        nxt = points[(i + 1) % n]
+        mid_prev = _midpoint(prev, curr)
+        mid_next = _midpoint(curr, nxt)
+        result.extend(_quadratic_bezier(mid_prev, curr, mid_next, n=8)[:-1])
+    result.append(result[0])
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Drafting Engine
+# ---------------------------------------------------------------------------
 
 class DraftingEngine:
-    """Computes pattern geometry from Measurements using standard
-    flat-pattern drafting formulas (Aldrich / Winifred Aldrich method),
-    with optional style overlays for cowl/gather/asymmetric silhouettes."""
+    """Measurement-driven pattern drafting engine.
 
-    def __init__(self, m: Measurements, ease: str = "standard", style: Optional[StyleDetails] = None):
-        self.m = m
-        self.style = style or StyleDetails()
-        self.ease_value = config.EASE_BODICE.get(ease, 4.0)
-        self.skirt_ease = config.EASE_SKIRT.get(ease, 3.0)
-        self.sa = config.SEAM_ALLOWANCE
-        self.hem = config.HEM_ALLOWANCE
+    Computes derived measurements and drafts pattern pieces for various
+    garment types.  Every piece is computed from actual body measurements;
+    no static/hardcoded patterns are used.
+    """
 
+    def __init__(self, measurements: Measurements,
+                 style: Optional[StyleDetails] = None,
+                 ease: str = 'standard'):
+        self.m = measurements
+        self.style = style if style is not None else StyleDetails()
+        self.ease_label = ease if ease in EASE_VALUES else 'standard'
+        self.ease_amount = EASE_VALUES.get(self.ease_label, 4.0)
+
+        # Derived measurements (all in cm)
         self._compute_derived()
 
-    def _compute_derived(self):
-        m = self.m
-        self.half_bust = m.bust / 2
-        self.quarter_bust = (m.bust + self.ease_value) / 4
-        self.quarter_waist = (m.waist + 1) / 4
-        self.quarter_hip = (m.hip + self.skirt_ease) / 4
+        # Pieces assembled during drafting
+        self.pieces: list = []
 
-        if m.armhole_depth <= 0:
-            self.armhole_depth = m.bust / 4 + 2.0
-        else:
-            self.armhole_depth = m.armhole_depth + 1.0
+    # ---- derived measurements ------------------------------------------------
+
+    def _compute_derived(self):
+        """Compute half-measurements and ease-adjusted values."""
+        m = self.m
+        e = self.ease_amount
+
+        self.half_bust = (m.bust + e) / 2.0
+        self.half_waist = (m.waist + e) / 2.0
+        self.half_hip = (m.hip + e) / 2.0
+
+        self.quarter_bust = (m.bust + e) / 4.0
+        self.quarter_waist = (m.waist + e) / 4.0
+        self.quarter_hip = (m.hip + e) / 4.0
 
         if m.neck_width <= 0:
-            self.neck_width = m.bust / 20 + 2.0
+            self.neck_width = m.bust / 6.0 + 2.5 if m.bust > 0 else 14.0
         else:
             self.neck_width = m.neck_width
 
-        if m.neck_depth_front <= 0:
-            self.neck_depth_front = self.neck_width + 1.5
-        else:
-            self.neck_depth_front = m.neck_depth_front
+        self.neck_depth_front = (m.neck_depth_front
+                                  if m.neck_depth_front > 0
+                                  else self.neck_width / 2.0 + 1.0)
+        self.neck_depth_back = (m.neck_depth_back
+                                 if m.neck_depth_back > 0
+                                 else self.neck_width / 4.0 + 0.5)
 
-        if m.neck_depth_back <= 0:
-            self.neck_depth_back = self.neck_width * 0.4
+        if m.armhole_depth <= 0:
+            self.armhole_depth = m.bust / 8.0 + 7.0 if m.bust > 0 else 21.0
         else:
-            self.neck_depth_back = m.neck_depth_back
+            self.armhole_depth = m.armhole_depth
 
         if m.shoulder_width <= 0:
-            self.shoulder_width = m.bust / 4 + 2.0
+            self.shoulder_width = m.bust / 4.0 if m.bust > 0 else 22.0
         else:
             self.shoulder_width = m.shoulder_width
 
-        # Drop shoulder extends the shoulder line outward
-        if self.style.drop_shoulder:
-            self.shoulder_length = (m.shoulder_length if m.shoulder_length > 0 else 12.0) + 5.0
+        self.half_shoulder = self.shoulder_width / 2.0
+
+        if m.back_length <= 0:
+            self.back_length = m.bust / 4.0 + 10.0 if m.bust > 0 else 40.0
         else:
-            self.shoulder_length = m.shoulder_length if m.shoulder_length > 0 else 12.0
+            self.back_length = m.back_length
 
-        self.waist_suppression = self.quarter_bust - self.quarter_waist
-
-        if m.dart_intake_bust <= 0:
-            self.bust_dart = min(self.waist_suppression * 0.6, 4.0)
+        if m.front_length <= 0:
+            self.front_length = self.back_length
         else:
-            self.bust_dart = m.dart_intake_bust
+            self.front_length = m.front_length
 
-        if m.dart_intake_waist_front <= 0:
-            self.front_waist_dart = min(self.waist_suppression * 0.4, 3.0)
+        if m.apex_to_apex <= 0:
+            self.apex_to_apex = m.bust / 5.0 if m.bust > 0 else 18.0
         else:
-            self.front_waist_dart = m.dart_intake_waist_front
+            self.apex_to_apex = m.apex_to_apex
 
-        if m.dart_intake_waist_back <= 0:
-            self.back_waist_dart = min(self.waist_suppression * 0.35, 2.5)
+        self.half_apex = self.apex_to_apex / 2.0
+
+        if m.shoulder_to_bust <= 0:
+            self.shoulder_to_bust = self.back_length / 2.0 + 3.0
         else:
-            self.back_waist_dart = m.dart_intake_waist_back
-
-        self.hip_depth = m.waist_to_hip if m.waist_to_hip > 0 else 20.0
+            self.shoulder_to_bust = m.shoulder_to_bust
 
         if m.bust_span <= 0:
-            self.bust_span = self.quarter_bust * 0.35
+            self.bust_span = self.apex_to_apex / 2.0 + 2.0
         else:
             self.bust_span = m.bust_span
 
-    # ----------------------------------------------------------------
-    # BODICE BLOCK — Front & Back (standard, fitted)
-    # ----------------------------------------------------------------
-
-    def draft_bodice_front(self) -> PatternPiece:
-        m = self.m
-        qb = self.quarter_bust
-        qw = self.quarter_waist
-        piece = PatternPiece(name="Front Bodice", piece_type="front", cut_qty=1)
-
-        cf_neck = Point(0, 0)
-        cf_waist = Point(0, -(m.back_length if m.back_length > 0 else 40))
-
-        neck_shoulder = Point(self.neck_width, 0)
-        neck_depth = Point(0, -self.neck_depth_front)
-
-        shoulder_tip = _polar(neck_shoulder, -25, self.shoulder_length)
-
-        ah_depth_y = shoulder_tip.y - self.armhole_depth
-        ah_side = Point(qb + 1.0, ah_depth_y)
-
-        side_waist = Point(qw + 1.5 + self.front_waist_dart, cf_waist.y)
-
-        # Base outline vertices (straight-segment skeleton; curves fill in below)
-        piece.outline = [
-            neck_depth,        # 0: CF neckpoint (low)
-            neck_shoulder,     # 1: shoulder neckpoint
-            shoulder_tip,      # 2: shoulder tip
-            ah_side,           # 3: armhole/side seam junction
-            side_waist,        # 4: side seam at waist
-            cf_waist,          # 5: CF at waist
-        ]
-
-        # Neckline curve: neck_depth(0) -> neck_shoulder(1)
-        piece.outline_curves[0] = _neckline_curve(neck_depth, neck_shoulder, depth_bulge=2.0)
-        # Armhole curve: shoulder_tip(2) -> ah_side(3)
-        piece.outline_curves[2] = _armhole_curve(shoulder_tip, ah_side, depth_bulge=3.0)
-
-        piece.seam_line = _offset_polyline(piece.outline, -self.sa)
-
-        # Bust dart
-        apex_x = self.bust_span
-        apex_y = cf_neck.y - (m.shoulder_to_bust if m.shoulder_to_bust > 0 else 10)
-        bust_apex = Point(apex_x, apex_y)
-        dart_start = Point(ah_side.x - 2, ah_side.y + 1)
-        piece.darts.append({
-            "start": dart_start.to_tuple(),
-            "end": _polar(dart_start, _angle(dart_start, bust_apex), _dist(dart_start, bust_apex)).to_tuple(),
-            "apex": bust_apex.to_tuple(),
-            "intake": self.bust_dart,
-        })
-
-        # Waist dart
-        waist_dart_start = Point(qb * 0.4, cf_waist.y)
-        waist_dart_end = Point(qb * 0.4 + self.front_waist_dart, cf_waist.y)
-        waist_dart_apex = Point(qb * 0.4 + self.front_waist_dart / 2, cf_waist.y + 8)
-        piece.darts.append({
-            "start": waist_dart_start.to_tuple(),
-            "end": waist_dart_end.to_tuple(),
-            "apex": waist_dart_apex.to_tuple(),
-            "intake": self.front_waist_dart,
-        })
-
-        piece.grainline = {
-            "start": Point(qb * 0.3, shoulder_tip.y - 5).to_tuple(),
-            "end": Point(qb * 0.3, cf_waist.y + 5).to_tuple(),
-            "direction": "vertical",
-        }
-
-        piece.notches.append(Point(shoulder_tip.x - 2, shoulder_tip.y))
-        piece.notches.append(Point(ah_side.x, ah_side.y - 1))
-        piece.notches.append(Point(self.bust_span, ah_depth_y))
-
-        piece.mirror_axis = {"start": cf_neck.to_tuple(), "end": cf_waist.to_tuple()}
-        piece.fold_lines.append({"points": [cf_neck, cf_waist], "label": "CF FOLD"})
-
-        piece.annotations.append({"pos": (qb / 2, 2), "text": "FRONT BODICE"})
-        piece.annotations.append({"pos": (0, -5), "text": "CF"})
-
-        piece.meta = {"garment": "bodice", "side": "front", "block": "basic"}
-        return piece
-
-    def draft_bodice_back(self) -> PatternPiece:
-        m = self.m
-        qb = self.quarter_bust
-        qw = self.quarter_waist
-        piece = PatternPiece(name="Back Bodice", piece_type="back", cut_qty=1)
-
-        cb_neck = Point(0, 0)
-        cb_waist = Point(0, -(m.back_length if m.back_length > 0 else 40))
-
-        neck_shoulder = Point(self.neck_width, 0)
-        neck_depth = Point(0, -self.neck_depth_back)
-
-        shoulder_tip = _polar(neck_shoulder, -22, self.shoulder_length - 1)
-
-        ah_side = Point(qb, shoulder_tip.y - self.armhole_depth)
-        side_waist = Point(qw + 1.5 + self.back_waist_dart, cb_waist.y)
-
-        piece.outline = [
-            neck_depth,
-            neck_shoulder,
-            shoulder_tip,
-            ah_side,
-            side_waist,
-            cb_waist,
-        ]
-
-        piece.outline_curves[0] = _neckline_curve(neck_depth, neck_shoulder, depth_bulge=1.2)
-        piece.outline_curves[2] = _armhole_curve(shoulder_tip, ah_side, depth_bulge=2.6)
-
-        piece.seam_line = _offset_polyline(piece.outline, -self.sa)
-
-        if self.back_waist_dart > 0:
-            sd_mid = _midpoint(neck_shoulder, shoulder_tip)
-            sd_apex = _polar(sd_mid, -90 - 30, 6)
-            piece.darts.append({
-                "start": _polar(sd_mid, _angle(neck_shoulder, shoulder_tip) - 90, 0.5).to_tuple(),
-                "end": _polar(sd_mid, _angle(neck_shoulder, shoulder_tip) + 90, 0.5).to_tuple(),
-                "apex": sd_apex.to_tuple(),
-                "intake": 1.0,
-            })
-
-        waist_dart_start = Point(qb * 0.45, cb_waist.y)
-        waist_dart_end = Point(qb * 0.45 + self.back_waist_dart, cb_waist.y)
-        waist_dart_apex = Point(qb * 0.45 + self.back_waist_dart / 2, cb_waist.y + 9)
-        piece.darts.append({
-            "start": waist_dart_start.to_tuple(),
-            "end": waist_dart_end.to_tuple(),
-            "apex": waist_dart_apex.to_tuple(),
-            "intake": self.back_waist_dart,
-        })
-
-        piece.grainline = {
-            "start": Point(qb * 0.3, shoulder_tip.y - 5).to_tuple(),
-            "end": Point(qb * 0.3, cb_waist.y + 5).to_tuple(),
-            "direction": "vertical",
-        }
-
-        piece.notches.append(_midpoint(neck_shoulder, shoulder_tip))
-        piece.notches.append(Point(ah_side.x - 2, ah_side.y))
-
-        piece.mirror_axis = {"start": cb_neck.to_tuple(), "end": cb_waist.to_tuple()}
-        piece.fold_lines.append({"points": [cb_neck, cb_waist], "label": "CB FOLD"})
-
-        piece.annotations.append({"pos": (qb / 2, 2), "text": "BACK BODICE"})
-        piece.annotations.append({"pos": (0, -5), "text": "CB"})
-
-        piece.meta = {"garment": "bodice", "side": "back", "block": "basic"}
-        return piece
-
-    # ----------------------------------------------------------------
-    # ASYMMETRIC / COWL / GATHERED FRONT PANEL (dynamic style path)
-    # ----------------------------------------------------------------
-
-    def draft_asymmetric_gathered_front(self) -> PatternPiece:
-        """
-        Drafts a front panel for cowl/wrap/gathered/asymmetric-hem styles.
-        The panel is wider than a standard bodice front to accommodate
-        drape, with gather fold-guide lines radiating from a pivot point
-        near the shoulder/neckline down to the gathered hem edge — this
-        mirrors how cowl/wrap draping is drafted on a slash-and-spread
-        basis in industry pattern rooms.
-        """
-        m = self.m
-        qb = self.quarter_bust
-        style = self.style
-        piece = PatternPiece(name="Front Panel (Asymmetric/Gathered)",
-                              piece_type="front", cut_qty=1)
-
-        body_length = m.back_length if m.back_length > 0 else 40
-        extra_drape = 8.0 if style.has_cowl else 4.0
-
-        # Higher/shorter side (right, structured shoulder)
-        shoulder_neck = Point(self.neck_width, 0)
-        shoulder_tip = _polar(shoulder_neck, -25, self.shoulder_length)
-        ah_depth_y = shoulder_tip.y - self.armhole_depth
-        ah_side = Point(qb + 1.0, ah_depth_y)
-
-        # Cowl/wrap pivot point — where the drape hangs from (near opposite shoulder/neck)
-        pivot = Point(self.neck_width * 0.3, -1.5)
-
-        # Draped hem — asymmetric: one side much lower than the other
-        hem_high = Point(qb * 0.15, -(body_length * 0.55))          # shorter hem point (near CF)
-        hem_low = Point(qb + 1.5, -(body_length * (1.15 if style.asymmetric_hem else 0.95)))  # lower drape hem at side
-
-        # Wrap-over edge — sweeps from the pivot across to the low hem
-        wrap_edge_ctrl = _polar(pivot, -60, extra_drape * 2.2)
-
-        piece.outline = [
-            pivot,          # 0: neckline pivot (cowl/wrap origin)
-            shoulder_neck,  # 1
-            shoulder_tip,   # 2
-            ah_side,        # 3
-            hem_low,        # 4: draped low hem at side
-            hem_high,       # 5: shorter hem near CF
-        ]
-
-        # Neckline curve (pivot -> shoulder_neck): soft cowl scoop
-        piece.outline_curves[0] = _neckline_curve(pivot, shoulder_neck, depth_bulge=3.5)
-        # Armhole curve
-        piece.outline_curves[2] = _armhole_curve(shoulder_tip, ah_side, depth_bulge=3.0)
-        # Wrap/drape edge curve (hem_low -> hem_high): cubic bezier sweeping curve
-        piece.outline_curves[4] = _cubic_bezier(
-            hem_low,
-            _polar(hem_low, 160, extra_drape * 1.5),
-            _polar(hem_high, -20, extra_drape * 1.5),
-            hem_high,
-            n=18,
-        )
-
-        piece.seam_line = _offset_polyline(piece.outline, -self.sa)
-
-        # Gather / cowl fold guides — radiating lines from pivot to the drape edge,
-        # matching the "sunburst" gather markings on cowl/wrap fronts
-        n_rays = 7 if style.has_gathers or style.has_cowl else 0
-        for i in range(n_rays):
-            t = i / max(n_rays - 1, 1)
-            target = Point(
-                hem_low.x + (hem_high.x - hem_low.x) * t,
-                hem_low.y + (hem_high.y - hem_low.y) * t,
-            )
-            piece.gather_guides.append({
-                "points": [pivot, target],
-                "label": "GATHER" if i == n_rays // 2 else "",
-            })
-
-        # Pleats (if specified) — evenly spaced fold guides near the hem
-        if style.has_pleats and style.pleat_count > 0:
-            for i in range(style.pleat_count):
-                t = (i + 1) / (style.pleat_count + 1)
-                px = hem_high.x + (ah_side.x - hem_high.x) * t
-                piece.pleat_guides.append({
-                    "points": [Point(px, ah_depth_y * 0.3), Point(px, hem_high.y * 0.9)],
-                    "label": "PLEAT FOLD",
-                })
-
-        piece.grainline = {
-            "start": Point(qb * 0.35, shoulder_tip.y - 5).to_tuple(),
-            "end": Point(qb * 0.35, hem_high.y + 5).to_tuple(),
-            "direction": "vertical",
-        }
-
-        piece.notches.append(Point(shoulder_tip.x - 2, shoulder_tip.y))
-        piece.notches.append(Point(ah_side.x, ah_side.y - 1))
-        piece.notches.append(pivot)
-
-        piece.mirror_axis = None  # asymmetric piece — not mirrored
-        piece.annotations.append({"pos": (qb / 2, 2), "text": "FRONT PANEL — ASYMMETRIC/GATHERED"})
-        if style.has_cowl:
-            piece.annotations.append({"pos": (pivot.x, pivot.y + 2), "text": "COWL DRAPE"})
-
-        piece.meta = {"garment": style.silhouette or "wrap", "side": "front",
-                      "block": "dynamic_asymmetric", "style": asdict(style)}
-        return piece
-
-    # ----------------------------------------------------------------
-    # SKIRT BLOCK
-    # ----------------------------------------------------------------
-
-    def draft_skirt(self) -> list[PatternPiece]:
-        pieces: list[PatternPiece] = []
-        qh = self.quarter_hip
-        qw = self.quarter_waist
-        length = self.m.skirt_length if self.m.skirt_length > 0 else 60
-
-        for side, dart_intake in [("front", min((qh - qw) * 0.4, 3.0)),
-                                   ("back", min((qh - qw) * 0.5, 3.5))]:
-            piece = PatternPiece(name=f"{side.capitalize()} Skirt", piece_type=side, cut_qty=1)
-
-            waist_top = Point(0, 0)
-            waist_side = Point(qh - 0.5, 0)
-            hem_side = Point(qh + 1.5, -length)
-            hem_center = Point(0, -length)
-
-            piece.outline = [waist_top, waist_side, hem_side, hem_center]
-
-            piece.seam_line = _offset_polyline(piece.outline, -self.sa)
-
-            piece.internal_lines.append({
-                "type": "reference",
-                "points": [Point(0, -self.hip_depth).to_tuple(),
-                           Point(qh, -self.hip_depth).to_tuple()],
-                "label": "hip_line",
-            })
-
-            dart1_pos = qh * 0.3
-            dart2_pos = qh * 0.65
-            for dp, di in [(dart1_pos, dart_intake * 0.45), (dart2_pos, dart_intake * 0.55)]:
-                if di > 0.5:
-                    piece.darts.append({
-                        "start": Point(dp, 0).to_tuple(),
-                        "end": Point(dp + di, 0).to_tuple(),
-                        "apex": Point(dp + di / 2, -9).to_tuple(),
-                        "intake": di,
-                    })
-
-            piece.grainline = {
-                "start": Point(qh * 0.4, -5).to_tuple(),
-                "end": Point(qh * 0.4, -length + 5).to_tuple(),
-                "direction": "vertical",
-            }
-
-            piece.notches.append(Point(qh * 0.4, -self.hip_depth))
-            piece.notches.append(Point(qh - 1, -self.hip_depth))
-
-            piece.mirror_axis = {"start": waist_top.to_tuple(), "end": hem_center.to_tuple()}
-            piece.fold_lines.append({"points": [waist_top, hem_center], "label": "CF/CB FOLD"})
-
-            piece.annotations.append({"pos": (qh / 2, -length / 2), "text": f"{side.upper()} SKIRT"})
-            piece.meta = {"garment": "skirt", "side": side, "block": "basic"}
-            pieces.append(piece)
-
-        return pieces
-
-    # ----------------------------------------------------------------
-    # SLEEVE BLOCK
-    # ----------------------------------------------------------------
-
-    def draft_sleeve(self) -> PatternPiece:
-        m = self.m
-        piece = PatternPiece(name="Sleeve", piece_type="sleeve", cut_qty=2)
+        self.bust_dart_intake = (m.dart_intake_bust
+                                 if m.dart_intake_bust > 0 else 3.0)
+        self.waist_dart_front = (m.dart_intake_waist_front
+                                  if m.dart_intake_waist_front > 0 else 2.5)
+        self.waist_dart_back = (m.dart_intake_waist_back
+                                 if m.dart_intake_waist_back > 0 else 3.0)
 
         if m.bicep <= 0:
-            bicep = self.armhole_depth * 2 + 4.0
+            self.bicep = m.bust / 3.0 + 4.0 if m.bust > 0 else 30.0
         else:
-            bicep = m.bicep + 3.0
+            self.bicep = m.bicep
 
-        wrist = m.wrist + 4.0 if m.wrist > 0 else bicep * 0.4
-        sleeve_length = m.sleeve_length if m.sleeve_length > 0 else 60
-        cap_height = self.armhole_depth * 0.4 + 2.0
+        if m.wrist <= 0:
+            self.wrist = m.bust / 6.0 + 6.0 if m.bust > 0 else 20.0
+        else:
+            self.wrist = m.wrist
 
-        center_top = Point(bicep / 2, 0)
-        center_wrist = Point(bicep / 2, -sleeve_length)
+        if m.skirt_length <= 0:
+            self.skirt_length = 60.0
+        else:
+            self.skirt_length = m.skirt_length
 
-        bicep_front = Point(0, -cap_height)
-        bicep_back = Point(bicep, -cap_height)
+        if m.dress_length <= 0:
+            self.dress_length = self.back_length + self.m.waist_to_hip + 30.0
+        else:
+            self.dress_length = m.dress_length
 
-        wrist_front = Point((bicep - wrist) / 2, -sleeve_length)
-        wrist_back = Point(bicep - (bicep - wrist) / 2, -sleeve_length)
+        self.shoulder_slope = (m.shoulder_slope
+                                if m.shoulder_slope > 0 else 4.0)
+        self.waist_to_hip = m.waist_to_hip if m.waist_to_hip > 0 else 20.0
 
-        piece.outline = [
-            bicep_front,    # 0
-            center_top,     # 1: cap apex
-            bicep_back,     # 2
-            wrist_back,     # 3
-            wrist_front,    # 4
-        ]
+    # ---- dispatch ------------------------------------------------------------
 
-        # Sleeve cap curve: front half (bicep_front -> center_top)
-        cap_ctrl1 = _polar(bicep_front, 75, cap_height * 0.65)
-        cap_ctrl2 = _polar(center_top, 200, cap_height * 0.5)
-        piece.outline_curves[0] = _sleeve_cap_curve(bicep_front, cap_ctrl1, cap_ctrl2, center_top, n=14)
+    def draft(self, garment_type: str) -> list:
+        """Master dispatch: draft pattern pieces for the given garment type.
 
-        # Sleeve cap curve: back half (center_top -> bicep_back)
-        cap_ctrl3 = _polar(center_top, -20, cap_height * 0.5)
-        cap_ctrl4 = _polar(bicep_back, 105, cap_height * 0.65)
-        piece.outline_curves[1] = _sleeve_cap_curve(center_top, cap_ctrl3, cap_ctrl4, bicep_back, n=14)
+        Returns a list of PatternPiece objects.
+        """
+        garment_type = garment_type.lower().strip()
+        self.pieces = []
 
-        piece.seam_line = _offset_polyline(piece.outline, -self.sa)
-
-        piece.grainline = {
-            "start": center_top.to_tuple(),
-            "end": center_wrist.to_tuple(),
-            "direction": "vertical",
+        dispatch = {
+            "dress": self._draft_dress,
+            "kurti": self._draft_kurti,
+            "top": self._draft_top,
+            "blouse": self._draft_blouse,
+            "shirt": self._draft_shirt,
+            "skirt": self._draft_skirt,
+            "sleeve": self._draft_sleeve_only,
+            "wrap": self._draft_wrap,
+            "bodice": self._draft_bodice,
+            "gown": self._draft_gown,
+            "kaftan": self._draft_kaftan,
         }
 
-        piece.notches.append(center_top)
-        piece.notches.append(_midpoint(bicep_front, center_top))
-        piece.notches.append(_midpoint(center_top, bicep_back))
-        piece.notches.append(Point(bicep / 2, -sleeve_length))
+        handler = dispatch.get(garment_type)
+        if handler is None:
+            handler = self._draft_bodice
 
-        elbow_y = -cap_height + (-sleeve_length - -cap_height) * 0.5
-        piece.internal_lines.append({
-            "type": "reference",
-            "points": [Point(0, elbow_y).to_tuple(), Point(bicep, elbow_y).to_tuple()],
-            "label": "elbow_line",
-        })
+        handler()
+        return self.pieces
 
-        piece.mirror_axis = {"start": center_top.to_tuple(), "end": center_wrist.to_tuple()}
+    # ---- bodice front --------------------------------------------------------
 
-        piece.annotations.append({"pos": (bicep / 2, -sleeve_length / 2), "text": "SLEEVE"})
-        piece.meta = {"garment": "sleeve", "block": "basic"}
+    def draft_bodice_front(self) -> PatternPiece:
+        """Draft a bodice front block.  Origin at centre-front-neck (0, 0).
+
+        Front piece faces right (+x is away from CF toward side seam).
+        """
+        half_bust = self.quarter_bust
+        half_waist = self.quarter_waist
+
+        cf_neck = Point(0, 0)
+        cf_waist = Point(0, -self.back_length)
+        cf_hem = Point(0, -self.back_length - 4.0)
+
+        neck_shoulder = Point(self.neck_width / 2.0, -self.neck_depth_back * 0.3)
+        shoulder_tip = _polar(neck_shoulder, -self.shoulder_slope,
+                             self.half_shoulder)
+
+        armhole_top = Point(shoulder_tip.x, -self.armhole_depth * 0.7)
+        side_top = Point(half_bust, -self.armhole_depth)
+        side_waist = Point(half_waist, -self.back_length)
+        side_hem = Point(half_waist, -self.back_length - 4.0)
+
+        neckline_pts = _neckline_curve(cf_neck, neck_shoulder,
+                                       self.neck_depth_front * 0.6)
+        armhole_pts = _armhole_curve(shoulder_tip, side_top,
+                                     self.armhole_depth * 0.15)
+
+        full_outline = [cf_neck]
+        full_outline.extend(neckline_pts[1:-1])
+        full_outline.append(neck_shoulder)
+        full_outline.append(shoulder_tip)
+        full_outline.extend(armhole_pts[1:-1])
+        full_outline.append(side_top)
+        full_outline.append(side_waist)
+        full_outline.append(cf_waist)
+        full_outline.append(cf_hem)
+        full_outline.append(side_hem)
+
+        neck_curve_end_idx = len(neckline_pts) - 1
+        arm_curve_end_idx = neck_curve_end_idx + len(armhole_pts)
+
+        curves = [
+            {"start_idx": 0, "end_idx": neck_curve_end_idx,
+             "control_points": [cf_neck, neck_shoulder], "type": "bezier"},
+            {"start_idx": neck_curve_end_idx + 1,
+             "end_idx": arm_curve_end_idx,
+             "control_points": [shoulder_tip, side_top], "type": "bezier"},
+        ]
+
+        darts = []
+        if self.style.has_darts:
+            apex = Point(self.bust_span, -self.shoulder_to_bust)
+            dart_start = Point(side_top.x - 1.5, side_top.y - 2.0)
+            darts.append(Dart(start=dart_start, end=apex,
+                              width=self.bust_dart_intake))
+
+            waist_dart_start = Point(0, -self.back_length + 0.5)
+            waist_dart_end = Point(self.half_apex, -self.shoulder_to_bust - 2.0)
+            darts.append(Dart(start=waist_dart_start, end=waist_dart_end,
+                              width=self.waist_dart_front))
+
+        notches = []
+        if self.style.has_notches:
+            arm_notch_pt = _midpoint(shoulder_tip, side_top)
+            notches.append(Notch(point=arm_notch_pt, depth=0.3, angle=0))
+            notches.append(Notch(point=Point(self.half_apex, -self.back_length),
+                                depth=0.3, angle=90))
+            notches.append(Notch(point=Point(0, -self.back_length / 2.0),
+                                depth=0.3, angle=90))
+
+        cx = half_bust / 2.0
+        grainline = [Point(cx, -2.0), Point(cx, -self.back_length + 2.0)]
+
+        piece = PatternPiece(
+            name="Bodice Front",
+            points=full_outline,
+            curves=curves,
+            darts=darts,
+            notches=notches,
+            grainline=grainline,
+            label=f"Bodice Front - {self.style.size_label or 'Custom'}",
+            cut_quantity=self.style.cut_quantities.get("bodice_front", 1),
+            layer=LAYER_CUT,
+        )
+
+        self._apply_styles_to_piece(piece, is_front=True)
         return piece
 
-    # ----------------------------------------------------------------
-    # SHIRT BLOCK
-    # ----------------------------------------------------------------
+    # ---- bodice back ---------------------------------------------------------
 
-    def draft_shirt(self) -> list[PatternPiece]:
-        m = self.m
-        pieces: list[PatternPiece] = []
+    def draft_bodice_back(self) -> PatternPiece:
+        """Draft a bodice back block.  Origin at centre-back-neck (0, 0).
 
-        self.ease_value = config.EASE_BODICE.get("loose", 6.0)
-        self.quarter_bust = (m.bust + self.ease_value) / 4
-        self.quarter_waist = (m.waist + 4) / 4
+        Back piece faces left (mirrored x).
+        """
+        half_bust = self.quarter_bust
+        half_waist = self.quarter_waist
+
+        cb_neck = Point(0, 0)
+        cb_waist = Point(0, -self.back_length)
+        cb_hem = Point(0, -self.back_length - 4.0)
+
+        neck_shoulder = Point(-self.neck_width / 2.0, -self.neck_depth_back * 0.3)
+        shoulder_tip = _polar(neck_shoulder, 180 + self.shoulder_slope,
+                             self.half_shoulder)
+
+        armhole_top = Point(shoulder_tip.x, -self.armhole_depth * 0.7)
+        side_top = Point(-half_bust, -self.armhole_depth)
+        side_waist = Point(-half_waist, -self.back_length)
+        side_hem = Point(-half_waist, -self.back_length - 4.0)
+
+        neckline_pts = _neckline_curve(cb_neck, neck_shoulder,
+                                        self.neck_depth_back * 0.5)
+        armhole_pts = _armhole_curve(shoulder_tip, side_top,
+                                     self.armhole_depth * 0.15)
+
+        full_outline = [cb_neck]
+        full_outline.extend(neckline_pts[1:-1])
+        full_outline.append(neck_shoulder)
+        full_outline.append(shoulder_tip)
+        full_outline.extend(armhole_pts[1:-1])
+        full_outline.append(side_top)
+        full_outline.append(side_waist)
+        full_outline.append(cb_waist)
+        full_outline.append(cb_hem)
+        full_outline.append(side_hem)
+
+        neck_curve_end_idx = len(neckline_pts) - 1
+        arm_curve_end_idx = neck_curve_end_idx + len(armhole_pts)
+
+        curves = [
+            {"start_idx": 0, "end_idx": neck_curve_end_idx,
+             "control_points": [cb_neck, neck_shoulder], "type": "bezier"},
+            {"start_idx": neck_curve_end_idx + 1,
+             "end_idx": arm_curve_end_idx,
+             "control_points": [shoulder_tip, side_top], "type": "bezier"},
+        ]
+
+        darts = []
+        if self.style.has_darts:
+            shoulder_dart_start = _midpoint(neck_shoulder, shoulder_tip)
+            shoulder_dart_end = Point(shoulder_dart_start.x - 1.0,
+                                       shoulder_dart_start.y - 4.0)
+            darts.append(Dart(start=shoulder_dart_start, end=shoulder_dart_end,
+                             width=1.5))
+
+            waist_dart_start = Point(-self.half_apex * 0.7, -self.back_length + 0.5)
+            waist_dart_end = Point(-self.half_apex * 0.7, -self.shoulder_to_bust)
+            darts.append(Dart(start=waist_dart_start, end=waist_dart_end,
+                             width=self.waist_dart_back))
+
+        notches = []
+        if self.style.has_notches:
+            arm_notch_pt = _midpoint(shoulder_tip, side_top)
+            notches.append(Notch(point=arm_notch_pt, depth=0.3, angle=180))
+            notches.append(Notch(point=Point(-self.half_apex, -self.back_length),
+                                depth=0.3, angle=90))
+            notches.append(Notch(point=Point(0, -self.back_length / 2.0),
+                                depth=0.3, angle=90))
+
+        cx = -half_bust / 2.0
+        grainline = [Point(cx, -2.0), Point(cx, -self.back_length + 2.0)]
+
+        piece = PatternPiece(
+            name="Bodice Back",
+            points=full_outline,
+            curves=curves,
+            darts=darts,
+            notches=notches,
+            grainline=grainline,
+            label=f"Bodice Back - {self.style.size_label or 'Custom'}",
+            cut_quantity=self.style.cut_quantities.get("bodice_back", 1),
+            layer=LAYER_CUT,
+        )
+
+        self._apply_styles_to_piece(piece, is_front=False)
+        return piece
+
+    # ---- sleeve ---------------------------------------------------------------
+
+    def draft_sleeve(self) -> PatternPiece:
+        """Draft a sleeve.  Origin at centre-top of sleeve cap (0, 0).
+
+        Grainline is vertical (downward = -y).
+        """
+        sleeve_len = self.m.sleeve_length if self.m.sleeve_length > 0 else 60.0
+        half_bicep = self.bicep / 2.0
+        half_wrist = self.wrist / 2.0
+
+        cap_height = self.bicep / 3.0 + 3.0
+        cap_width = half_bicep + 1.0
+
+        cap_top = Point(0, 0)
+        cap_left = Point(-cap_width, -cap_height)
+        cap_right = Point(cap_width, -cap_height)
+
+        wrist_left = Point(-half_wrist, -sleeve_len)
+        wrist_right = Point(half_wrist, -sleeve_len)
+
+        ctrl1 = Point(cap_width * 0.6, -cap_height * 0.3)
+        ctrl2 = Point(cap_width * 0.3, -cap_height * 0.9)
+        cap_curve_right = _sleeve_cap_curve(cap_top, ctrl1, ctrl2, cap_right)
+
+        ctrl1l = Point(-cap_width * 0.6, -cap_height * 0.3)
+        ctrl2l = Point(-cap_width * 0.3, -cap_height * 0.9)
+        cap_curve_left = _sleeve_cap_curve(cap_top, ctrl1l, ctrl2l, cap_left)
+
+        full_outline = [cap_top]
+        full_outline.extend(cap_curve_right[1:-1])
+        full_outline.append(cap_right)
+        full_outline.append(wrist_right)
+        full_outline.append(wrist_left)
+        full_outline.append(cap_left)
+        full_outline.extend(list(reversed(cap_curve_left))[1:-1])
+
+        right_curve_end = len(cap_curve_right)
+        curves = [
+            {"start_idx": 0, "end_idx": right_curve_end,
+             "control_points": [cap_top, ctrl1, ctrl2, cap_right],
+             "type": "bezier"},
+            {"start_idx": right_curve_end + 3,
+             "end_idx": len(full_outline) - 1,
+             "control_points": [cap_left, ctrl2l, ctrl1l, cap_top],
+             "type": "bezier"},
+        ]
+
+        notches = []
+        if self.style.has_notches:
+            notch_idx = len(cap_curve_right) // 3
+            if notch_idx < len(cap_curve_right):
+                notches.append(Notch(point=cap_curve_right[notch_idx],
+                                    depth=0.3, angle=90))
+            notch_idx = len(cap_curve_left) // 3
+            if notch_idx < len(cap_curve_left):
+                notches.append(Notch(point=cap_curve_left[notch_idx],
+                                    depth=0.3, angle=90))
+            notches.append(Notch(point=Point(0, -sleeve_len * 0.5),
+                                depth=0.3, angle=90))
+
+        grainline = [Point(0, -cap_height), Point(0, -sleeve_len + 1.0)]
+
+        piece = PatternPiece(
+            name="Sleeve",
+            points=full_outline,
+            curves=curves,
+            darts=[],
+            notches=notches,
+            grainline=grainline,
+            label=f"Sleeve - {self.style.size_label or 'Custom'}",
+            cut_quantity=self.style.cut_quantities.get("sleeve", 2),
+            layer=LAYER_CUT,
+        )
+
+        if sleeve_len > 40 and self.style.has_darts:
+            elbow = Point(0, -sleeve_len * 0.5)
+            dart_start = Point(-half_bicep * 0.5, -sleeve_len * 0.5)
+            dart_end = Point(half_bicep * 0.5, -sleeve_len * 0.5)
+            piece.darts.append(Dart(start=dart_start, end=dart_end, width=1.5))
+
+        return piece
+
+    # ---- skirt front ----------------------------------------------------------
+
+    def draft_skirt_front(self) -> PatternPiece:
+        """Draft a skirt front panel.  Origin at centre-front-waist (0, 0).
+
+        Front faces right (+x toward side seam).
+        """
+        half_hip = self.quarter_hip
+        half_waist = self.quarter_waist
+        skirt_len = self.skirt_length
+
+        cf_waist = Point(0, 0)
+        cf_hem = Point(0, -skirt_len)
+        side_waist = Point(half_hip, -1.5)
+        side_hem = Point(half_hip + 3.0, -skirt_len)
+
+        hip_y = -self.waist_to_hip
+        side_hip = Point(half_hip, hip_y)
+
+        waist_hip_curve = _quadratic_bezier(side_waist,
+                                             Point(half_hip - 0.5, hip_y / 2),
+                                             side_hip, n=12)
+
+        full_outline = [cf_waist]
+        full_outline.extend(waist_hip_curve[1:-1])
+        full_outline.append(side_hip)
+        full_outline.append(side_hem)
+        full_outline.append(cf_hem)
+
+        curves = [
+            {"start_idx": 0, "end_idx": len(waist_hip_curve),
+             "control_points": [side_waist, side_hip], "type": "bezier"},
+        ]
+
+        darts = []
+        if self.style.has_darts:
+            dart1_start = Point(self.half_apex, 0)
+            dart1_end = Point(self.half_apex, -self.waist_to_hip * 0.6)
+            darts.append(Dart(start=dart1_start, end=dart1_end,
+                             width=self.waist_dart_front))
+
+            if half_waist < half_hip - 5.0:
+                dart2_start = Point(self.half_apex * 0.4, 0)
+                dart2_end = Point(self.half_apex * 0.4,
+                                  -self.waist_to_hip * 0.5)
+                darts.append(Dart(start=dart2_start, end=dart2_end,
+                                 width=1.5))
+
+        notches = []
+        if self.style.has_notches:
+            notches.append(Notch(point=Point(0, hip_y), depth=0.3, angle=90))
+            notches.append(Notch(point=side_hip, depth=0.3, angle=0))
+
+        cx = half_hip / 2.0
+        grainline = [Point(cx, -2.0), Point(cx, -skirt_len + 2.0)]
+
+        piece = PatternPiece(
+            name="Skirt Front",
+            points=full_outline,
+            curves=curves,
+            darts=darts,
+            notches=notches,
+            grainline=grainline,
+            label=f"Skirt Front - {self.style.size_label or 'Custom'}",
+            cut_quantity=self.style.cut_quantities.get("skirt_front", 1),
+            layer=LAYER_CUT,
+        )
+
+        if self.style.asymmetric_hem:
+            piece.points = self._make_asymmetric_hem(piece.points)
+
+        return piece
+
+    # ---- skirt back -----------------------------------------------------------
+
+    def draft_skirt_back(self) -> PatternPiece:
+        """Draft a skirt back panel (mirrored x)."""
+        half_hip = self.quarter_hip
+        half_waist = self.quarter_waist
+        skirt_len = self.skirt_length
+
+        cb_waist = Point(0, 0)
+        cb_hem = Point(0, -skirt_len)
+        side_waist = Point(-half_hip, -1.5)
+        side_hem = Point(-half_hip - 3.0, -skirt_len)
+
+        hip_y = -self.waist_to_hip
+        side_hip = Point(-half_hip, hip_y)
+
+        waist_hip_curve = _quadratic_bezier(side_waist,
+                                             Point(-half_hip + 0.5, hip_y / 2),
+                                             side_hip, n=12)
+
+        full_outline = [cb_waist]
+        full_outline.extend(waist_hip_curve[1:-1])
+        full_outline.append(side_hip)
+        full_outline.append(side_hem)
+        full_outline.append(cb_hem)
+
+        curves = [
+            {"start_idx": 0, "end_idx": len(waist_hip_curve),
+             "control_points": [side_waist, side_hip], "type": "bezier"},
+        ]
+
+        darts = []
+        if self.style.has_darts:
+            dart1_start = Point(-self.half_apex, 0)
+            dart1_end = Point(-self.half_apex, -self.waist_to_hip * 0.6)
+            darts.append(Dart(start=dart1_start, end=dart1_end,
+                             width=self.waist_dart_back))
+
+            if half_waist < half_hip - 5.0:
+                dart2_start = Point(-self.half_apex * 0.4, 0)
+                dart2_end = Point(-self.half_apex * 0.4,
+                                  -self.waist_to_hip * 0.5)
+                darts.append(Dart(start=dart2_start, end=dart2_end,
+                                 width=1.5))
+
+        notches = []
+        if self.style.has_notches:
+            notches.append(Notch(point=Point(0, hip_y), depth=0.3, angle=90))
+            notches.append(Notch(point=side_hip, depth=0.3, angle=180))
+
+        cx = -half_hip / 2.0
+        grainline = [Point(cx, -2.0), Point(cx, -skirt_len + 2.0)]
+
+        piece = PatternPiece(
+            name="Skirt Back",
+            points=full_outline,
+            curves=curves,
+            darts=darts,
+            notches=notches,
+            grainline=grainline,
+            label=f"Skirt Back - {self.style.size_label or 'Custom'}",
+            cut_quantity=self.style.cut_quantities.get("skirt_back", 1),
+            layer=LAYER_CUT,
+        )
+
+        if self.style.asymmetric_hem:
+            piece.points = self._make_asymmetric_hem(piece.points)
+
+        return piece
+
+    # ---- collar ---------------------------------------------------------------
+
+    def draft_collar(self) -> PatternPiece:
+        """Draft a collar piece (stand-and-fall, band, mandarin, shawl, etc.).
+
+        Collar is drafted as a rectangle with curved ends; length follows the
+        neck circumference, width depends on the collar type.
+        """
+        neck_circ = self.neck_width * 2.0 + math.pi * (self.neck_width / 2.0)
+        collar_length = neck_circ
+        collar_type = (self.style.collar_type.lower()
+                        if self.style.collar_type else "band")
+
+        if "stand" in collar_type or "fall" in collar_type:
+            collar_width = 6.0
+            stand_width = 3.5
+            total_width = collar_width + stand_width
+        elif "mandarin" in collar_type:
+            collar_width = 4.0
+            total_width = collar_width
+        elif "shawl" in collar_type:
+            collar_width = 8.0
+            total_width = collar_width
+        else:
+            collar_width = 5.0
+            total_width = collar_width
+
+        tl = Point(-collar_length / 2.0, total_width)
+        tr = Point(collar_length / 2.0, total_width)
+        br = Point(collar_length / 2.0, 0)
+        bl = Point(-collar_length / 2.0, 0)
+
+        end_curve_r = _quadratic_bezier(
+            tr, Point(collar_length / 2.0 + 1.0, total_width / 2.0), br, n=10)
+        end_curve_l = _quadratic_bezier(
+            bl, Point(-collar_length / 2.0 - 1.0, total_width / 2.0), tl, n=10)
+
+        full_outline = [tl]
+        full_outline.extend(end_curve_r[1:-1])
+        full_outline.append(br)
+        full_outline.append(bl)
+        full_outline.extend(list(reversed(end_curve_l))[1:-1])
+
+        curves = [
+            {"start_idx": 0, "end_idx": len(end_curve_r),
+             "control_points": [tr, br], "type": "bezier"},
+            {"start_idx": len(end_curve_r) + 2,
+             "end_idx": len(full_outline) - 1,
+             "control_points": [bl, tl], "type": "bezier"},
+        ]
+
+        grainline = [Point(-collar_length / 2.0 + 1.0, total_width / 2.0),
+                     Point(collar_length / 2.0 - 1.0, total_width / 2.0)]
+
+        notches = []
+        if self.style.has_notches:
+            notches.append(Notch(point=Point(0, total_width / 2.0),
+                                 depth=0.3, angle=90))
+            notches.append(Notch(point=Point(-collar_length / 2.0 + 1.0,
+                                             total_width / 2.0),
+                                 depth=0.3, angle=0))
+            notches.append(Notch(point=Point(collar_length / 2.0 - 1.0,
+                                             total_width / 2.0),
+                                 depth=0.3, angle=0))
+
+        piece = PatternPiece(
+            name="Collar",
+            points=full_outline,
+            curves=curves,
+            darts=[],
+            notches=notches,
+            grainline=grainline,
+            label=f"Collar ({collar_type}) - {self.style.size_label or 'Custom'}",
+            cut_quantity=self.style.cut_quantities.get("collar", 1),
+            layer=LAYER_CUT,
+        )
+        return piece
+
+    # ---- cowl -----------------------------------------------------------------
+
+    def draft_cowl(self) -> PatternPiece:
+        """Draft a cowl neckline drape piece.
+
+        The cowl is a draped extension from the shoulder/neck area, drafted
+        as a rectangle with a cowl curve cut from one side.
+        """
+        cowl_depth = 12.0
+        cowl_width = self.neck_width * 1.5
+
+        tl = Point(0, cowl_depth)
+        tr = Point(cowl_width, cowl_depth)
+        br = Point(cowl_width, 0)
+        bl = Point(0, 0)
+
+        cowl_curve = _cubic_bezier(
+            tl,
+            Point(cowl_width * 0.1, cowl_depth * 0.5),
+            Point(cowl_width * 0.3, cowl_depth * 0.8),
+            Point(cowl_width * 0.5, cowl_depth * 0.5),
+            n=20)
+
+        full_outline = [tl]
+        full_outline.extend(cowl_curve[1:-1])
+        full_outline.append(Point(cowl_width * 0.5, cowl_depth * 0.5))
+        full_outline.append(tr)
+        full_outline.append(br)
+        full_outline.append(bl)
+
+        curves = [
+            {"start_idx": 0, "end_idx": len(cowl_curve),
+             "control_points": [tl, Point(cowl_width * 0.3, cowl_depth * 0.8)],
+             "type": "bezier"},
+        ]
+
+        grainline = [Point(cowl_width / 2.0, cowl_depth / 2.0),
+                     Point(cowl_width / 2.0, cowl_depth / 2.0 - 3.0)]
+
+        notches = []
+        if self.style.has_notches:
+            notches.append(Notch(point=Point(0, cowl_depth / 2.0),
+                                 depth=0.3, angle=90))
+
+        piece = PatternPiece(
+            name="Cowl",
+            points=full_outline,
+            curves=curves,
+            darts=[],
+            notches=notches,
+            grainline=grainline,
+            label=f"Cowl Drape - {self.style.size_label or 'Custom'}",
+            cut_quantity=self.style.cut_quantities.get("cowl", 1),
+            layer=LAYER_CUT,
+        )
+        return piece
+
+    # ---- facing ---------------------------------------------------------------
+
+    def draft_facing(self) -> PatternPiece:
+        """Draft a front facing piece.
+
+        The facing follows the neckline and front edge, extending inward by
+        a facing width.
+        """
+        facing_width = 5.0
+
+        cf_neck = Point(0, 0)
+        neck_shoulder = Point(self.neck_width / 2.0,
+                              -self.neck_depth_back * 0.3)
+        shoulder_tip = _polar(neck_shoulder, -self.shoulder_slope,
+                              self.half_shoulder)
+
+        neckline_pts = _neckline_curve(cf_neck, neck_shoulder,
+                                        self.neck_depth_front * 0.6)
+
+        shoulder_facing_end = _polar(
+            shoulder_tip,
+            _angle(neck_shoulder, shoulder_tip),
+            facing_width)
+
+        facing_bottom_inner = Point(0, -self.neck_depth_front - facing_width - 3.0)
+        facing_bottom_outer = Point(self.neck_width / 2.0 + facing_width,
+                                     -self.neck_depth_front - facing_width - 3.0)
+
+        full_outline = [cf_neck]
+        full_outline.extend(neckline_pts[1:-1])
+        full_outline.append(neck_shoulder)
+        full_outline.append(shoulder_tip)
+        full_outline.append(shoulder_facing_end)
+        full_outline.append(facing_bottom_outer)
+        full_outline.append(facing_bottom_inner)
+
+        curves = [
+            {"start_idx": 0, "end_idx": len(neckline_pts),
+             "control_points": [cf_neck, neck_shoulder], "type": "bezier"},
+        ]
+
+        grainline = [Point(facing_width / 2.0, -2.0),
+                     Point(facing_width / 2.0, -self.neck_depth_front - 2.0)]
+
+        notches = []
+        if self.style.has_notches:
+            notches.append(Notch(point=_midpoint(cf_neck, neck_shoulder),
+                                 depth=0.3, angle=90))
+
+        piece = PatternPiece(
+            name="Front Facing",
+            points=full_outline,
+            curves=curves,
+            darts=[],
+            notches=notches,
+            grainline=grainline,
+            label=f"Front Facing - {self.style.size_label or 'Custom'}",
+            cut_quantity=self.style.cut_quantities.get("facing", 1),
+            layer=LAYER_CUT,
+        )
+        return piece
+
+    # ---- style modifications --------------------------------------------------
+
+    def _apply_styles_to_piece(self, piece: PatternPiece, is_front: bool):
+        """Apply style modifications to a drafted piece in-place."""
+        style = self.style
+
+        if style.has_gathers:
+            locations = style.gather_locations if style.gather_locations else ["waist"]
+            for loc in locations:
+                if loc == "waist":
+                    notch_pt = Point(piece.points[0].x / 2.0,
+                                     -self.back_length + 1.0)
+                    piece.notches.append(Notch(point=notch_pt, depth=0.5, angle=90))
+                    piece.label += " (Gathered at waist)"
+                elif loc == "neckline":
+                    if len(piece.points) > 1:
+                        notch_pt = _midpoint(piece.points[0], piece.points[1])
+                    else:
+                        notch_pt = piece.points[0]
+                    piece.notches.append(Notch(point=notch_pt, depth=0.5, angle=90))
+                    piece.label += " (Gathered neckline)"
+                elif loc == "hem":
+                    notch_pt = Point(piece.points[0].x / 2.0,
+                                     -self.back_length - 2.0)
+                    piece.notches.append(Notch(point=notch_pt, depth=0.5, angle=90))
+                    piece.label += " (Gathered hem)"
+                elif loc == "sleeve_cap":
+                    notch_pt = Point(piece.points[0].x / 2.0,
+                                     -self.armhole_depth / 2.0)
+                    piece.notches.append(Notch(point=notch_pt, depth=0.5, angle=90))
+                    piece.label += " (Gathered sleeve cap)"
+
+        if style.has_pleats and style.pleat_count > 0:
+            pleat_spacing = 3.0
+            for i in range(style.pleat_count):
+                offset = (i + 1) * pleat_spacing
+                px = offset if is_front else -offset
+                pleat_top = Point(px, -self.back_length * 0.3)
+                pleat_bottom = Point(px, -self.back_length - 2.0)
+                piece.darts.append(Dart(start=pleat_top, end=pleat_bottom, width=2.0))
+            piece.label += f" ({style.pleat_count} pleats)"
+
+        if style.has_cowl and is_front:
+            for i in range(min(5, len(piece.points))):
+                piece.points[i] = Point(piece.points[i].x,
+                                        piece.points[i].y - 3.0)
+            piece.label += " (Cowl neck)"
+
+        if style.asymmetric_hem:
+            piece.points = self._make_asymmetric_hem(piece.points)
+            piece.label += " (Asymmetric hem)"
+
+        if style.drop_shoulder:
+            for i, pt in enumerate(piece.points):
+                if pt.y < -self.armhole_depth * 0.5 and abs(pt.x) > self.quarter_bust * 0.5:
+                    piece.points[i] = Point(pt.x + (2.0 if pt.x > 0 else -2.0),
+                                           pt.y - 3.0)
+            piece.label += " (Drop shoulder)"
+
+    def _make_asymmetric_hem(self, points: list) -> list:
+        """Make the hemline asymmetric by varying the y-coordinate."""
+        result = []
+        for pt in points:
+            if pt.y < -self.back_length:
+                asym = abs(pt.x) * 0.15
+                result.append(Point(pt.x, pt.y - asym))
+            else:
+                result.append(pt)
+        return result
+
+    # ---- garment type handlers ------------------------------------------------
+
+    def _draft_bodice(self):
+        """Draft a basic bodice block (front + back)."""
+        self.pieces.append(self.draft_bodice_front())
+        self.pieces.append(self.draft_bodice_back())
+
+    def _draft_top(self):
+        """Draft a top: bodice front + back + sleeves + facing + optional collar."""
+        self.pieces.append(self.draft_bodice_front())
+        self.pieces.append(self.draft_bodice_back())
+        self.pieces.append(self.draft_sleeve())
+        if self.style.has_collar:
+            self.pieces.append(self.draft_collar())
+        self.pieces.append(self.draft_facing())
+
+    def _draft_blouse(self):
+        """Draft a blouse: bodice front + back + optional collar + facing."""
+        self.pieces.append(self.draft_bodice_front())
+        self.pieces.append(self.draft_bodice_back())
+        if self.style.has_collar:
+            self.pieces.append(self.draft_collar())
+        self.pieces.append(self.draft_facing())
+
+    def _draft_shirt(self):
+        """Draft a shirt: bodice front + back + sleeves + collar + facing."""
+        self.pieces.append(self.draft_bodice_front())
+        self.pieces.append(self.draft_bodice_back())
+        self.pieces.append(self.draft_sleeve())
+        if not self.style.collar_type:
+            self.style.collar_type = "band"
+        self.pieces.append(self.draft_collar())
+        self.pieces.append(self.draft_facing())
+
+    def _draft_skirt(self):
+        """Draft a skirt: front + back panels."""
+        self.pieces.append(self.draft_skirt_front())
+        self.pieces.append(self.draft_skirt_back())
+
+    def _draft_sleeve_only(self):
+        """Draft just a sleeve piece."""
+        self.pieces.append(self.draft_sleeve())
+
+    def _draft_wrap(self):
+        """Draft a wrap garment: extended front + back + sleeves + facing."""
+        front = self.draft_bodice_front()
+        extended_points = []
+        for pt in front.points:
+            if pt.x > 0:
+                extended_points.append(Point(pt.x + 8.0, pt.y))
+            else:
+                extended_points.append(pt)
+        front.points = extended_points
+        front.name = "Wrap Front"
+        front.label = f"Wrap Front - {self.style.size_label or 'Custom'}"
+        self.pieces.append(front)
+        self.pieces.append(self.draft_bodice_back())
+        self.pieces.append(self.draft_sleeve())
+        self.pieces.append(self.draft_facing())
+
+    def _draft_dress(self):
+        """Draft a dress: bodice front + back + skirt front + back + sleeves + extras."""
+        self.pieces.append(self.draft_bodice_front())
+        self.pieces.append(self.draft_bodice_back())
+        self.pieces.append(self.draft_skirt_front())
+        self.pieces.append(self.draft_skirt_back())
+        self.pieces.append(self.draft_sleeve())
+        if self.style.has_collar:
+            self.pieces.append(self.draft_collar())
+        if self.style.has_cowl:
+            self.pieces.append(self.draft_cowl())
+        self.pieces.append(self.draft_facing())
+
+    def _draft_kurti(self):
+        """Draft a kurti: long bodice (extended) + sleeves + facing + extras.
+
+        A kurti is a long tunic, so the bodice length is extended.
+        """
+        original_back_length = self.back_length
+        self.back_length = self.dress_length
 
         front = self.draft_bodice_front()
-        front.name = "Front Shirt"
-        front.meta["garment"] = "shirt"
-        front.annotations[0]["text"] = "FRONT SHIRT"
-        pieces.append(front)
+        front.name = "Kurti Front"
+        front.label = f"Kurti Front - {self.style.size_label or 'Custom'}"
+        self.pieces.append(front)
 
         back = self.draft_bodice_back()
-        back.name = "Back Shirt"
-        back.meta["garment"] = "shirt"
-        back.annotations[0]["text"] = "BACK SHIRT"
-        pieces.append(back)
+        back.name = "Kurti Back"
+        back.label = f"Kurti Back - {self.style.size_label or 'Custom'}"
+        self.pieces.append(back)
 
-        if m.sleeve_length > 0:
-            sleeve = self.draft_sleeve()
-            sleeve.meta["garment"] = "shirt"
-            pieces.append(sleeve)
+        self.back_length = original_back_length
 
-        collar = self._draft_collar_band()
-        pieces.append(collar)
+        self.pieces.append(self.draft_sleeve())
+        if self.style.has_collar:
+            self.pieces.append(self.draft_collar())
+        if self.style.has_cowl:
+            self.pieces.append(self.draft_cowl())
+        self.pieces.append(self.draft_facing())
 
-        return pieces
+    def _draft_gown(self):
+        """Draft a gown: bodice + long skirt + sleeves + optional cowl."""
+        self.pieces.append(self.draft_bodice_front())
+        self.pieces.append(self.draft_bodice_back())
 
-    def _draft_collar_band(self) -> PatternPiece:
-        neck_opening = self.neck_width * 2 * math.pi * 0.4
-        collar_height = 4.0
+        original_skirt = self.skirt_length
+        self.skirt_length = max(self.dress_length - self.back_length, 80.0)
+        self.pieces.append(self.draft_skirt_front())
+        self.pieces.append(self.draft_skirt_back())
+        self.skirt_length = original_skirt
 
-        piece = PatternPiece(name="Collar Band", piece_type="collar", cut_qty=2)
-        piece.outline = [
-            Point(0, 0),
-            Point(neck_opening / 2, 0),
-            Point(neck_opening / 2, collar_height),
-            Point(0, collar_height),
+        self.pieces.append(self.draft_sleeve())
+        if self.style.has_cowl:
+            self.pieces.append(self.draft_cowl())
+        self.pieces.append(self.draft_facing())
+
+    def _draft_kaftan(self):
+        """Draft a kaftan: loose rectangular T-shape with neck opening.
+
+        A kaftan is a loose-fitting garment with a very wide silhouette.
+        Drafted as a large rectangular piece with a neck opening.
+        """
+        original_ease = self.ease_amount
+        self.ease_amount = EASE_VALUES["loose"]
+        self.quarter_bust = (self.m.bust + self.ease_amount) / 4.0
+        self.quarter_waist = self.quarter_bust
+        self.quarter_hip = (self.m.hip + self.ease_amount) / 4.0
+
+        kaftan_length = self.dress_length if self.dress_length > 0 else 100.0
+        half_width = self.quarter_bust + 10.0
+
+        tl = Point(-half_width, 0)
+        tr = Point(half_width, 0)
+        br = Point(half_width, -kaftan_length)
+        bl = Point(-half_width, -kaftan_length)
+
+        neck_w = self.neck_width
+        neck_d = self.neck_depth_front
+        neck_left = Point(-neck_w / 2.0, 0)
+        neck_right = Point(neck_w / 2.0, 0)
+
+        neckline = _neckline_curve(neck_left, neck_right, neck_d * 0.5)
+
+        full_outline = [neck_left]
+        full_outline.extend(neckline[1:-1])
+        full_outline.append(neck_right)
+        full_outline.append(tr)
+        full_outline.append(br)
+        full_outline.append(bl)
+        full_outline.append(tl)
+        full_outline.append(neck_left)
+
+        curves = [
+            {"start_idx": 0, "end_idx": len(neckline),
+             "control_points": [neck_left, neck_right], "type": "bezier"},
         ]
-        piece.seam_line = _offset_polyline(piece.outline, -self.sa)
-        piece.grainline = {
-            "start": (neck_opening / 4, 1),
-            "end": (neck_opening / 4, collar_height - 1),
-            "direction": "horizontal",
-        }
-        piece.annotations.append({"pos": (neck_opening / 4, collar_height / 2), "text": "COLLAR"})
-        piece.meta = {"garment": "collar", "block": "basic"}
-        return piece
 
-    # ----------------------------------------------------------------
-    # DRESS / KURTI (bodice + skirt combined, style-aware)
-    # ----------------------------------------------------------------
+        notches = []
+        if self.style.has_notches:
+            notches.append(Notch(point=Point(half_width * 0.8, -self.armhole_depth),
+                                 depth=0.3, angle=90))
+            notches.append(Notch(point=Point(-half_width * 0.8, -self.armhole_depth),
+                                 depth=0.3, angle=90))
 
-    def draft_dress(self, garment_label: str = "DRESS") -> list[PatternPiece]:
-        m = self.m
-        style = self.style
-        pieces: list[PatternPiece] = []
+        grainline = [Point(0, -5.0), Point(0, -kaftan_length + 5.0)]
 
-        # Front: dynamic asymmetric/gathered/cowl OR standard bodice
-        if style.is_dynamic_front():
-            front = self.draft_asymmetric_gathered_front()
-            front.name = f"Front {garment_label.title()} Panel"
-        else:
-            front = self.draft_bodice_front()
-            front.name = f"Front {garment_label.title()} Bodice"
-        front.meta["garment"] = garment_label.lower()
-        pieces.append(front)
+        front = PatternPiece(
+            name="Kaftan Front",
+            points=full_outline,
+            curves=curves,
+            darts=[],
+            notches=notches,
+            grainline=grainline,
+            label=f"Kaftan Front - {self.style.size_label or 'Custom'}",
+            cut_quantity=1,
+            layer=LAYER_CUT,
+        )
 
-        back = self.draft_bodice_back()
-        back.name = f"Back {garment_label.title()} Bodice"
-        back.meta["garment"] = garment_label.lower()
-        if style.drop_shoulder:
-            back.annotations.append({"pos": (0, 2), "text": "DROP SHOULDER"})
-        pieces.append(back)
+        neck_d_back = self.neck_depth_back
+        neckline_back = _neckline_curve(neck_left, neck_right, neck_d_back * 0.5)
 
-        if m.dress_length > 0 and not style.is_dynamic_front():
-            # Standard dress: separate skirt panel below bodice.
-            # (Asymmetric/cowl styles already extend the front panel to full length.)
-            self.m.skirt_length = max(m.dress_length - (m.back_length if m.back_length > 0 else 40), 20)
-            skirt_pieces = self.draft_skirt()
-            for sp in skirt_pieces:
-                sp.name = sp.name.replace("Skirt", f"{garment_label.title()} Skirt")
-                sp.meta["garment"] = garment_label.lower()
-            pieces.extend(skirt_pieces)
+        back_outline = [neck_left]
+        back_outline.extend(neckline_back[1:-1])
+        back_outline.append(neck_right)
+        back_outline.append(tr)
+        back_outline.append(br)
+        back_outline.append(bl)
+        back_outline.append(tl)
+        back_outline.append(neck_left)
 
-        if m.sleeve_length > 0:
-            sleeve_front = self.draft_sleeve()
-            sleeve_front.name = f"{garment_label.title()} Sleeve — Front" if style.is_dynamic_front() else "Sleeve"
-            sleeve_front.meta["garment"] = garment_label.lower()
-            pieces.append(sleeve_front)
-
-            if style.is_dynamic_front():
-                sleeve_back = self.draft_sleeve()
-                sleeve_back.name = f"{garment_label.title()} Sleeve — Back"
-                sleeve_back.meta["garment"] = garment_label.lower()
-                sleeve_back.cut_qty = 2
-                pieces.append(sleeve_back)
-
-        if not style.is_dynamic_front():
-            facing = self._draft_neck_facing()
-            facing.meta["garment"] = garment_label.lower()
-            pieces.append(facing)
-        elif style.has_collar or style.collar_type:
-            neck_shoulder_detail = self._draft_neck_shoulder_detail()
-            neck_shoulder_detail.meta["garment"] = garment_label.lower()
-            pieces.append(neck_shoulder_detail)
-
-        return pieces
-
-    def _draft_neck_facing(self) -> PatternPiece:
-        piece = PatternPiece(name="Neck Facing", piece_type="facing", cut_qty=1)
-        nw = self.neck_width
-        nd = self.neck_depth_front
-        facing_depth = 5.0
-
-        piece.outline = [
-            Point(0, 0),
-            Point(nw + 2, 0),
-            Point(nw + 2, -facing_depth),
-            Point(0, -facing_depth - nd * 0.3),
+        back_curves = [
+            {"start_idx": 0, "end_idx": len(neckline_back),
+             "control_points": [neck_left, neck_right], "type": "bezier"},
         ]
-        piece.seam_line = _offset_polyline(piece.outline, -self.sa)
-        piece.grainline = {
-            "start": (nw / 2, 0),
-            "end": (nw / 2, -facing_depth),
-            "direction": "vertical",
-        }
-        piece.annotations.append({"pos": (nw / 2, -facing_depth / 2), "text": "NECK FACING"})
-        piece.meta = {"garment": "facing", "block": "derived"}
-        return piece
 
-    def _draft_neck_shoulder_detail(self) -> PatternPiece:
-        """Small detail piece documenting the neck/shoulder gather zone —
-        mirrors the 'NECK & SHOULDER GATHER DETAIL' callout on reference sheets."""
-        piece = PatternPiece(name="Neck & Shoulder Gather Detail", piece_type="detail", cut_qty=1)
-        nw = self.neck_width
-        piece.outline = [
-            Point(0, 0),
-            Point(nw * 1.4, 0),
-            Point(nw * 1.4, -nw * 0.9),
-            Point(0, -nw * 0.6),
-        ]
-        for i in range(4):
-            t = (i + 1) / 5
-            piece.gather_guides.append({
-                "points": [Point(0, -nw * 0.3), Point(nw * 1.4 * t, -nw * 0.9 * t)],
-                "label": "",
-            })
-        piece.annotations.append({"pos": (nw * 0.5, -nw * 0.3), "text": "NECK & SHOULDER GATHER DETAIL"})
-        piece.meta = {"garment": "detail", "block": "derived"}
-        return piece
+        back = PatternPiece(
+            name="Kaftan Back",
+            points=back_outline,
+            curves=back_curves,
+            darts=[],
+            notches=notches,
+            grainline=grainline,
+            label=f"Kaftan Back - {self.style.size_label or 'Custom'}",
+            cut_quantity=1,
+            layer=LAYER_CUT,
+        )
 
-    # ----------------------------------------------------------------
-    # MASTER DISPATCHER
-    # ----------------------------------------------------------------
+        self.pieces.append(front)
+        self.pieces.append(back)
 
-    def draft(self, garment_type: str) -> list[PatternPiece]:
-        gt = garment_type.lower().strip()
-
-        if gt in ("dress",):
-            return self.draft_dress("dress")
-        elif gt in ("kurti",):
-            return self.draft_dress("kurti")
-        elif gt in ("top", "blouse", "wrap", "wrap top", "poncho"):
-            return self.draft_dress(gt if gt else "top")
-        elif gt == "bodice":
-            return [self.draft_bodice_front(), self.draft_bodice_back()]
-        elif gt == "skirt":
-            return self.draft_skirt()
-        elif gt == "shirt":
-            return self.draft_shirt()
-        elif gt == "sleeve":
-            return [self.draft_sleeve()]
-        else:
-            # Default: dress/kurti block (still style-aware)
-            return self.draft_dress("dress")
+        self.ease_amount = original_ease
+        self._compute_derived()
 
 
-# ====================================================================
-# DXF / AAMA EXPORT ENGINE
-# ====================================================================
+# ---------------------------------------------------------------------------
+# DXF Exporter
+# ---------------------------------------------------------------------------
 
 class DXFExporter:
-    """Exports PatternPieces to a DXF file using AAMA layer conventions,
-    rendering true curves (armhole/neckline/sleeve cap) as splines."""
+    """Export PatternPiece objects to an AAMA-compliant DXF file using ezdxf.
 
-    def __init__(self):
-        self.layers = config.AAMA_LAYERS
+    ezdxf is imported lazily inside methods so that the module can be used
+    for drafting even when ezdxf is not installed.
+    """
 
-    def export(self, pieces: list[PatternPiece], filepath: str,
-               garment_type: str = "garment",
-               measurements: Optional[Measurements] = None,
-               size_label: str = "") -> str:
-        doc = ezdxf.new(dxfversion="R2000")
-        doc.header["$INSUNITS"] = 5  # centimetres
-        msp = doc.modelspace()
-
-        self._setup_layers(doc)
-
-        offset_x = 0
-        col_count = 0
-        max_cols = 3
-        col_width = 55
-
-        for piece in pieces:
-            self._draw_piece(doc, msp, piece, offset_x, 0, size_label)
-            col_count += 1
-            if col_count >= max_cols:
-                offset_x = 0
-            else:
-                offset_x += col_width
-
-        self._add_header(msp, garment_type, measurements, size_label)
-
-        doc.saveas(filepath)
-        return filepath
+    LAYER_DEFS = {
+        "1": (1, "CUT"),
+        "3": (3, "NOTCH"),
+        "4": (4, "GRAIN / INTERNAL"),
+        "6": (6, "REFERENCE"),
+        "7": (7, "ANNOTATION"),
+        "8": (8, "SEAM"),
+        "9": (9, "MIRROR"),
+    }
 
     def _setup_layers(self, doc):
-        layer_defs = [
-            (self.layers.get("CUT", "1"), 1),
-            (self.layers.get("SEAM", "8"), 5),
-            (self.layers.get("GRAIN", "4"), 3),
-            (self.layers.get("NOTCH", "3"), 2),
-            (self.layers.get("INTERNAL", "4"), 6),
-            (self.layers.get("REFERENCE", "6"), 8),
-            (self.layers.get("ANNOTATION", "7"), 7),
-            (self.layers.get("MIRROR", "9"), 4),
-        ]
-        for name, color in layer_defs:
-            if name not in doc.layers:
-                doc.layers.add(name=name, color=color)
+        """Create AAMA layers in the DXF document."""
+        for layer_name, (color, desc) in self.LAYER_DEFS.items():
+            if layer_name not in doc.layers:
+                doc.layers.add(name=layer_name, color=color)
 
-    @staticmethod
-    def _xy(p, ox, oy):
-        x, y = (p.x, p.y) if hasattr(p, "x") else (p[0], p[1])
-        return (x + ox, y + oy)
+    def _write_piece(self, msp, piece: PatternPiece, offset_x: float,
+                     offset_y: float):
+        """Write a single PatternPiece to the modelspace."""
+        pts = piece.points
+        if not pts:
+            return
 
-    def _build_smooth_outline(self, piece: PatternPiece) -> list:
-        """Expand outline + outline_curves into the full point sequence for CUT rendering."""
-        pts = []
-        n = len(piece.outline)
-        for i in range(n):
-            pts.append(piece.outline[i])
-            if i in piece.outline_curves:
-                pts.extend(piece.outline_curves[i])
-        return pts
+        poly_pts = [(p.x + offset_x, p.y + offset_y) for p in pts]
+        msp.add_lwpolyline(
+            poly_pts,
+            dxfattribs={"layer": piece.layer or "1", "closed": True},
+        )
 
-    def _draw_piece(self, doc, msp, piece: PatternPiece,
-                    offset_x: float, offset_y: float, size_label: str = ""):
-        ox, oy = offset_x, offset_y
+        for curve in piece.curves:
+            start_idx = curve.get("start_idx", 0)
+            end_idx = curve.get("end_idx", 0)
+            if 0 <= start_idx < len(pts) and 0 <= end_idx < len(pts):
+                sp = pts[start_idx]
+                ep = pts[end_idx]
+                ctrl_pts = curve.get("control_points", [])
+                if len(ctrl_pts) >= 2:
+                    cps = ctrl_pts
+                    if len(cps) == 2:
+                        bez = _quadratic_bezier(
+                            Point(sp.x + offset_x, sp.y + offset_y),
+                            Point(cps[0].x + offset_x, cps[0].y + offset_y),
+                            Point(ep.x + offset_x, ep.y + offset_y),
+                        )
+                    elif len(cps) >= 4:
+                        bez = _cubic_bezier(
+                            Point(sp.x + offset_x, sp.y + offset_y),
+                            Point(cps[1].x + offset_x, cps[1].y + offset_y),
+                            Point(cps[2].x + offset_x, cps[2].y + offset_y),
+                            Point(ep.x + offset_x, ep.y + offset_y),
+                        )
+                    else:
+                        bez = [Point(sp.x + offset_x, sp.y + offset_y),
+                               Point(ep.x + offset_x, ep.y + offset_y)]
+                    msp.add_lwpolyline(
+                        [(b.x, b.y) for b in bez],
+                        dxfattribs={"layer": "8"},
+                    )
 
-        # --- Cutting outline (CUT layer), curve-expanded ---
-        if piece.outline:
-            full_pts = self._build_smooth_outline(piece)
-            pts = [self._xy(p, ox, oy) for p in full_pts]
-            pts.append(pts[0])
-            msp.add_lwpolyline(pts, dxfattribs={
-                "layer": self.layers.get("CUT", "1"),
-                "linetype": "CONTINUOUS",
-                "lineweight": 35,
-            })
-
-        # --- Seam line (SEAM layer, dashed) ---
-        if piece.seam_line:
-            pts = [self._xy(p, ox, oy) for p in piece.seam_line]
-            pts.append(pts[0])
-            msp.add_lwpolyline(pts, dxfattribs={
-                "layer": self.layers.get("SEAM", "8"),
-                "linetype": "DASHED",
-            })
-
-        # --- Darts ---
         for dart in piece.darts:
-            start, end, apex = dart.get("start"), dart.get("end"), dart.get("apex")
-            if start and end and apex:
-                sx, sy = self._xy(start, ox, oy)
-                ex, ey = self._xy(end, ox, oy)
-                ax, ay = self._xy(apex, ox, oy)
-                msp.add_line((sx, sy), (ax, ay), dxfattribs={"layer": self.layers.get("INTERNAL", "4")})
-                msp.add_line((ex, ey), (ax, ay), dxfattribs={"layer": self.layers.get("INTERNAL", "4")})
-
-        # --- Notches ---
-        for notch in piece.notches:
-            nx, ny = self._xy(notch, ox, oy)
-            msp.add_line((nx - 0.5, ny), (nx + 0.5, ny), dxfattribs={"layer": self.layers.get("NOTCH", "3")})
-            msp.add_line((nx, ny - 0.5), (nx, ny + 0.5), dxfattribs={"layer": self.layers.get("NOTCH", "3")})
-
-        # --- Grainline with directional arrows ---
-        if piece.grainline:
-            gl = piece.grainline
-            start, end = gl.get("start"), gl.get("end")
-            if start and end:
-                sx, sy = self._xy(start, ox, oy)
-                ex, ey = self._xy(end, ox, oy)
-                msp.add_line((sx, sy), (ex, ey), dxfattribs={"layer": self.layers.get("GRAIN", "4"), "linetype": "PHANTOM"})
-                angle = math.atan2(ey - sy, ex - sx)
-                arrow_size = 1.5
-                for tip, base_angle in [((sx, sy), angle + math.pi), ((ex, ey), angle)]:
-                    for ang_off in (-0.4, 0.4):
-                        ang = base_angle + ang_off
-                        msp.add_line(tip, (tip[0] + arrow_size * math.cos(ang),
-                                           tip[1] + arrow_size * math.sin(ang)),
-                                    dxfattribs={"layer": self.layers.get("GRAIN", "4")})
-                msp.add_text("GRAINLINE", dxfattribs={
-                    "layer": self.layers.get("ANNOTATION", "7"), "height": 0.9,
-                }).set_placement(((sx + ex) / 2 + 1, (sy + ey) / 2))
-
-        # --- Internal reference lines ---
-        for iline in piece.internal_lines:
-            pts = iline.get("points", [])
-            if len(pts) >= 2:
-                for i in range(len(pts) - 1):
-                    p1x, p1y = self._xy(pts[i], ox, oy)
-                    p2x, p2y = self._xy(pts[i + 1], ox, oy)
-                    msp.add_line((p1x, p1y), (p2x, p2y), dxfattribs={"layer": self.layers.get("REFERENCE", "6")})
-
-        # --- Fold lines ---
-        for fl in piece.fold_lines:
-            pts = fl.get("points", [])
-            if len(pts) >= 2:
-                p1x, p1y = self._xy(pts[0], ox, oy)
-                p2x, p2y = self._xy(pts[1], ox, oy)
-                msp.add_line((p1x, p1y), (p2x, p2y), dxfattribs={
-                    "layer": self.layers.get("MIRROR", "9"), "linetype": "DASHDOT",
-                })
-
-        # --- Gather guides (radiating fold/ease lines) ---
-        for gg in piece.gather_guides:
-            pts = gg.get("points", [])
-            if len(pts) >= 2:
-                p1x, p1y = self._xy(pts[0], ox, oy)
-                p2x, p2y = self._xy(pts[1], ox, oy)
-                msp.add_line((p1x, p1y), (p2x, p2y), dxfattribs={
-                    "layer": self.layers.get("INTERNAL", "4"), "linetype": "DASHED",
-                })
-                if gg.get("label"):
-                    msp.add_text(gg["label"], dxfattribs={
-                        "layer": self.layers.get("ANNOTATION", "7"), "height": 0.8,
-                    }).set_placement((p2x, p2y))
-
-        # --- Pleat guides ---
-        for pg in piece.pleat_guides:
-            pts = pg.get("points", [])
-            if len(pts) >= 2:
-                p1x, p1y = self._xy(pts[0], ox, oy)
-                p2x, p2y = self._xy(pts[1], ox, oy)
-                msp.add_line((p1x, p1y), (p2x, p2y), dxfattribs={
-                    "layer": self.layers.get("INTERNAL", "4"), "linetype": "DASHDOT2",
-                })
-
-        # --- Mirror axis (CF/CB) ---
-        if piece.mirror_axis:
-            s, e = piece.mirror_axis.get("start"), piece.mirror_axis.get("end")
-            if s and e:
-                sx, sy = self._xy(s, ox, oy)
-                ex, ey = self._xy(e, ox, oy)
-                msp.add_line((sx, sy), (ex, ey), dxfattribs={"layer": self.layers.get("MIRROR", "9"), "linetype": "CENTER"})
-
-        # --- Annotations ---
-        for ann in piece.annotations:
-            pos = ann.get("pos", (0, 0))
-            text = ann.get("text", "")
-            px, py = self._xy(pos, ox, oy)
-            msp.add_text(text, dxfattribs={
-                "layer": self.layers.get("ANNOTATION", "7"), "height": 1.5,
-            }).set_placement((px, py))
-
-        # --- Piece name / cut qty / size label block ---
-        if piece.outline:
-            label_pt = self._xy(piece.outline[0], ox, oy)
-            cut_text = f"{piece.name.upper()} - CUT {piece.cut_qty}"
-            if size_label:
-                cut_text += f" - SIZE {size_label}"
-            msp.add_text(cut_text, dxfattribs={
-                "layer": self.layers.get("ANNOTATION", "7"), "height": 1.1,
-            }).set_placement((label_pt[0], label_pt[1] + 3))
-
-    def _add_header(self, msp, garment_type: str,
-                    measurements: Optional[Measurements], size_label: str = ""):
-        header_y = 8
-        info_lines = [
-            f"GARMENT: {garment_type.upper()}" + (f"  SIZE: {size_label}" if size_label else ""),
-            f"DATE: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
-            f"SEAM ALLOWANCE: {config.SEAM_ALLOWANCE}cm (~0.5in) | AAMA LAYERS: 1=Cut 8=Seam 4=Internal/Grain 3=Notch",
-        ]
-        if measurements:
-            info_lines.extend([
-                f"BUST: {measurements.bust}cm  WAIST: {measurements.waist}cm  HIP: {measurements.hip}cm",
-            ])
-
-        for i, line in enumerate(info_lines):
-            msp.add_text(line, dxfattribs={
-                "layer": config.AAMA_LAYERS["ANNOTATION"], "height": 1.3,
-            }).set_placement((-5, header_y + i * 2))
-
-
-# ====================================================================
-# PDS TEMPLATE DATABASE
-# ====================================================================
-
-class TemplateDB:
-    """SQLite-based storage for PDS templates and matched specs."""
-
-    def __init__(self, db_path: str = None):
-        self.db_path = db_path or config.DATABASE_PATH
-        os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
-        self._init_db()
-
-    def _init_db(self):
-        conn = sqlite3.connect(self.db_path)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS templates (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                garment_type TEXT NOT NULL,
-                garment_subtype TEXT,
-                size_label TEXT,
-                measurements_json TEXT NOT NULL,
-                file_path TEXT,
-                file_hash TEXT,
-                metadata_json TEXT,
-                created_at TEXT DEFAULT (datetime('now', 'localtime')),
-                updated_at TEXT DEFAULT (datetime('now', 'localtime'))
+            sp = (dart.start.x + offset_x, dart.start.y + offset_y)
+            ep = (dart.end.x + offset_x, dart.end.y + offset_y)
+            msp.add_line(sp, ep, dxfattribs={"layer": "4"})
+            ang = _angle(dart.start, dart.end)
+            w = dart.width / 2.0
+            leg1 = _polar(dart.start, ang + 90, w)
+            leg2 = _polar(dart.start, ang - 90, w)
+            msp.add_line(
+                (leg1.x + offset_x, leg1.y + offset_y),
+                (dart.end.x + offset_x, dart.end.y + offset_y),
+                dxfattribs={"layer": "4"},
             )
-        """)
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_garment_type ON templates(garment_type)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_file_hash ON templates(file_hash)")
-        conn.commit()
-        conn.close()
+            msp.add_line(
+                (leg2.x + offset_x, leg2.y + offset_y),
+                (dart.end.x + offset_x, dart.end.y + offset_y),
+                dxfattribs={"layer": "4"},
+            )
 
-    def store_template(self, garment_type: str, measurements: dict,
-                       file_path: str = None, subtype: str = None,
-                       size_label: str = None, metadata: dict = None) -> int:
-        conn = sqlite3.connect(self.db_path)
-        file_hash = None
-        if file_path and os.path.exists(file_path):
-            with open(file_path, "rb") as f:
-                file_hash = hashlib.sha256(f.read()).hexdigest()
+        for notch in piece.notches:
+            np_ = notch.point
+            ang = notch.angle
+            d = notch.depth
+            p1 = _polar(Point(np_.x + offset_x, np_.y + offset_y), ang, d)
+            p2 = _polar(Point(np_.x + offset_x, np_.y + offset_y), ang + 180, d)
+            msp.add_line((p1.x, p1.y), (p2.x, p2.y), dxfattribs={"layer": "3"})
 
-        cursor = conn.cursor()
-        cursor.execute("""
-            INSERT INTO templates (garment_type, garment_subtype, size_label,
-                                   measurements_json, file_path, file_hash, metadata_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (
-            garment_type, subtype, size_label,
-            json.dumps(measurements), file_path, file_hash,
-            json.dumps(metadata or {}),
-        ))
-        conn.commit()
-        template_id = cursor.lastrowid
-        conn.close()
-        return template_id
+        if piece.grainline and len(piece.grainline) >= 2:
+            g0 = piece.grainline[0]
+            g1 = piece.grainline[1]
+            msp.add_line(
+                (g0.x + offset_x, g0.y + offset_y),
+                (g1.x + offset_x, g1.y + offset_y),
+                dxfattribs={"layer": "4"},
+            )
+            ang = math.degrees(math.atan2(g1.y - g0.y, g1.x - g0.x))
+            arrow_size = 1.5
+            a1 = _polar(Point(g1.x + offset_x, g1.y + offset_y),
+                        ang + 150, arrow_size)
+            a2 = _polar(Point(g1.x + offset_x, g1.y + offset_y),
+                        ang - 150, arrow_size)
+            msp.add_line(
+                (g1.x + offset_x, g1.y + offset_y),
+                (a1.x, a1.y),
+                dxfattribs={"layer": "4"},
+            )
+            msp.add_line(
+                (g1.x + offset_x, g1.y + offset_y),
+                (a2.x, a2.y),
+                dxfattribs={"layer": "4"},
+            )
 
-    def find_match(self, garment_type: str, measurements: dict,
-                   tolerance: float = 3.0) -> Optional[dict]:
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        cursor.execute("""
-            SELECT id, garment_type, measurements_json, file_path, metadata_json
-            FROM templates WHERE garment_type = ? ORDER BY created_at DESC
-        """, (garment_type,))
-        rows = cursor.fetchall()
-        conn.close()
+        if piece.label:
+            label_x = offset_x
+            label_y = offset_y
+            if pts:
+                label_x = offset_x + sum(p.x for p in pts) / len(pts)
+                label_y = offset_y + sum(p.y for p in pts) / len(pts)
+            msp.add_text(
+                piece.label,
+                dxfattribs={
+                    "layer": "7",
+                    "height": 2.0,
+                    "rotation": 0,
+                    "insert": (label_x, label_y),
+                },
+            )
 
-        best_match = None
-        best_score = float("inf")
-        for row in rows:
-            stored_measurements = json.loads(row[2])
-            score = self._measurement_distance(measurements, stored_measurements)
-            if score < best_score and score < tolerance * max(len(measurements), 1):
-                best_score = score
-                best_match = {
-                    "id": row[0], "garment_type": row[1],
-                    "measurements": stored_measurements, "file_path": row[3],
-                    "metadata": json.loads(row[4]) if row[4] else {}, "score": best_score,
-                }
-        return best_match
+    def _write_measurements_table(self, msp, measurements_dict: dict,
+                                  offset_x: float, offset_y: float):
+        """Write a measurements reference table on the REFERENCE layer."""
+        y = offset_y
+        msp.add_text(
+            "MEASUREMENTS",
+            dxfattribs={
+                "layer": "6",
+                "height": 3.0,
+                "insert": (offset_x, y),
+            },
+        )
+        y -= 5.0
+        for key, value in measurements_dict.items():
+            text = f"{key}: {value}"
+            msp.add_text(
+                text,
+                dxfattribs={
+                    "layer": "6",
+                    "height": 1.5,
+                    "insert": (offset_x, y),
+                },
+            )
+            y -= 3.0
 
-    def _measurement_distance(self, m1: dict, m2: dict) -> float:
-        common_keys = set(m1.keys()) & set(m2.keys())
-        if not common_keys:
-            return float("inf")
-        dist = 0.0
-        for k in common_keys:
-            try:
-                v1 = float(m1.get(k, 0))
-                v2 = float(m2.get(k, 0))
-            except (ValueError, TypeError):
-                continue
-            if v1 > 0 and v2 > 0:
-                dist += abs(v1 - v2) ** 2
-        return math.sqrt(dist)
+    def _write_style_info(self, msp, style: Optional[StyleDetails],
+                          offset_x: float, offset_y: float):
+        """Write style information on the REFERENCE layer."""
+        if style is None:
+            return
+        y = offset_y
+        msp.add_text(
+            "STYLE DETAILS",
+            dxfattribs={
+                "layer": "6",
+                "height": 3.0,
+                "insert": (offset_x, y),
+            },
+        )
+        y -= 5.0
+        style_lines = [
+            f"Silhouette: {style.silhouette}",
+            f"Cowl: {'Yes' if style.has_cowl else 'No'}",
+            f"Gathers: {'Yes' if style.has_gathers else 'No'}",
+            f"Pleats: {style.pleat_count if style.has_pleats else 0}",
+            f"Drop shoulder: {'Yes' if style.drop_shoulder else 'No'}",
+            f"Collar: {style.collar_type if style.has_collar else 'None'}",
+            f"Asymmetric hem: {'Yes' if style.asymmetric_hem else 'No'}",
+            f"Closure: {style.closure or 'None'}",
+            f"Size: {style.size_label or 'Custom'}",
+        ]
+        for line in style_lines:
+            msp.add_text(
+                line,
+                dxfattribs={
+                    "layer": "6",
+                    "height": 1.5,
+                    "insert": (offset_x, y),
+                },
+            )
+            y -= 3.0
 
-    def list_templates(self, garment_type: str = None) -> list[dict]:
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        if garment_type:
-            cursor.execute("""
-                SELECT id, garment_type, garment_subtype, size_label,
-                       measurements_json, file_path, created_at
-                FROM templates WHERE garment_type = ? ORDER BY created_at DESC
-            """, (garment_type,))
-        else:
-            cursor.execute("""
-                SELECT id, garment_type, garment_subtype, size_label,
-                       measurements_json, file_path, created_at
-                FROM templates ORDER BY created_at DESC
-            """)
-        rows = cursor.fetchall()
-        conn.close()
-        return [{
-            "id": r[0], "garment_type": r[1], "subtype": r[2],
-            "size_label": r[3], "measurements": json.loads(r[4]),
-            "file_path": r[5], "created_at": r[6],
-        } for r in rows]
+    def export(self, pieces: list, filepath: str,
+               measurements_dict: dict, style: Optional[StyleDetails] = None):
+        """Export a list of PatternPiece objects to a DXF file.
 
-    def delete_template(self, template_id: int) -> bool:
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM templates WHERE id = ?", (template_id,))
-        conn.commit()
-        deleted = cursor.rowcount > 0
-        conn.close()
-        return deleted
+        Parameters
+        ----------
+        pieces : list of PatternPiece
+            The pattern pieces to export.
+        filepath : str
+            Output file path for the DXF file.
+        measurements_dict : dict
+            Dictionary of measurement key -> value for the reference table.
+        style : StyleDetails, optional
+            Style details for the reference table.
+        """
+        import ezdxf
 
+        doc = ezdxf.new("R2000")
+        self._setup_layers(doc)
+        msp = doc.modelspace()
 
-# ====================================================================
-# HIGH-LEVEL API
-# ====================================================================
+        col_spacing = 80.0
+        row_spacing = 120.0
+        pieces_per_row = 4
 
-def _dict_to_style(d: dict) -> StyleDetails:
-    valid_keys = {f for f in StyleDetails.__dataclass_fields__}
-    filtered = {k: v for k, v in d.items() if k in valid_keys}
-    return StyleDetails(**filtered)
+        for i, piece in enumerate(pieces):
+            col = i % pieces_per_row
+            row = i // pieces_per_row
+            offset_x = col * col_spacing
+            offset_y = -row * row_spacing
+            self._write_piece(msp, piece, offset_x, offset_y)
+
+        ref_x = 0.0
+        ref_y = -((len(pieces) // pieces_per_row) + 1) * row_spacing
+        self._write_measurements_table(msp, measurements_dict, ref_x, ref_y)
+        self._write_style_info(msp, style, ref_x + 50.0, ref_y)
+
+        doc.saveas(filepath)
 
 
-def generate_pattern(measurements: Measurements | dict,
-                     garment_type: str = "dress",
-                     ease: str = "standard",
-                     style: Optional[StyleDetails | dict] = None,
-                     output_path: str = None) -> str:
+# ---------------------------------------------------------------------------
+# Master functions
+# ---------------------------------------------------------------------------
+
+def draft_pieces(measurements: Measurements, garment_type: str,
+                 ease: str = 'standard',
+                 style: Optional[StyleDetails] = None) -> tuple:
+    """Draft pattern pieces for the given measurements and garment type.
+
+    Parameters
+    ----------
+    measurements : Measurements
+        Body measurements dataclass.
+    garment_type : str
+        One of: dress, kurti, top, blouse, shirt, skirt, sleeve, wrap,
+        bodice, gown, kaftan.
+    ease : str
+        Ease level: minimal, standard, loose, none, fitted, comfort.
+    style : StyleDetails, optional
+        Style modifications to apply.
+
+    Returns
+    -------
+    tuple of (list[PatternPiece], DraftingEngine)
     """
-    Master function — takes measurements, garment type, and optional style
-    details, returns path to the generated DXF.
-    """
-    if isinstance(measurements, dict):
-        m = Measurements(**{k: v for k, v in measurements.items()
-                           if hasattr(Measurements, k)})
-    else:
-        m = measurements
+    if style is None:
+        style = StyleDetails()
 
-    if not m.validate():
-        raise ValueError(f"Insufficient measurements. Missing: {m.missing_keys()}")
-
-    if isinstance(style, dict):
-        style = _dict_to_style(style)
-
-    engine = DraftingEngine(m, ease=ease, style=style)
-    pieces = engine.draft(garment_type)
-
-    if output_path is None:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_path = os.path.join(config.OUTPUT_DIR, f"{garment_type}_pattern_{timestamp}.dxf")
-
-    size_label = style.size_label if isinstance(style, StyleDetails) else ""
-
-    exporter = DXFExporter()
-    exporter.export(pieces, output_path, garment_type=garment_type,
-                    measurements=m, size_label=size_label)
-
-    return output_path
-
-
-def draft_pieces(measurements: Measurements | dict,
-                 garment_type: str = "dress",
-                 ease: str = "standard",
-                 style: Optional[StyleDetails | dict] = None) -> tuple[list[PatternPiece], DraftingEngine]:
-    """Returns the raw PatternPiece list + engine (used by blueprint renderer)."""
-    if isinstance(measurements, dict):
-        m = Measurements(**{k: v for k, v in measurements.items()
-                           if hasattr(Measurements, k)})
-    else:
-        m = measurements
-
-    if isinstance(style, dict):
-        style = _dict_to_style(style)
-
-    engine = DraftingEngine(m, ease=ease, style=style)
+    engine = DraftingEngine(measurements, style, ease)
     pieces = engine.draft(garment_type)
     return pieces, engine
 
 
-def generate_spec_summary(measurements: Measurements | dict,
-                          garment_type: str = "dress",
-                          ease: str = "standard",
-                          style: Optional[StyleDetails | dict] = None) -> str:
-    """Returns a human-readable garment specification summary."""
-    if isinstance(measurements, dict):
-        m = Measurements(**{k: v for k, v in measurements.items()
-                           if hasattr(Measurements, k)})
-    else:
-        m = measurements
+def export_dxf(pieces: list, filepath: str,
+               measurements_dict: dict,
+               style: Optional[StyleDetails] = None):
+    """Export pattern pieces to a DXF file.
 
-    if isinstance(style, dict):
-        style = _dict_to_style(style)
-    style = style or StyleDetails()
-
-    engine = DraftingEngine(m, ease=ease, style=style)
-    ease_val = engine.ease_value
-    skirt_ease = engine.skirt_ease
-
-    summary = f"""📋 GARMENT SPECIFICATION SUMMARY
-═══════════════════════════════════
-
-GARMENT TYPE: {garment_type.upper()}
-SILHOUETTE: {style.silhouette.upper() if style.silhouette else 'STANDARD'}
-SIZE: {style.size_label or 'N/A'}
-EASE: {ease.upper()} (bodice +{ease_val}cm, skirt +{skirt_ease}cm)
-SEAM ALLOWANCE: {config.SEAM_ALLOWANCE}cm
-HEM ALLOWANCE: {config.HEM_ALLOWANCE}cm
-"""
-
-    style_flags = []
-    if style.has_cowl: style_flags.append("Cowl drape")
-    if style.has_gathers: style_flags.append(f"Gathers ({', '.join(style.gather_locations)})" if style.gather_locations else "Gathers")
-    if style.has_pleats: style_flags.append(f"Pleats x{style.pleat_count}")
-    if style.asymmetric_hem: style_flags.append("Asymmetric hem")
-    if style.drop_shoulder: style_flags.append("Drop shoulder")
-    if style.closure: style_flags.append(f"Closure: {style.closure}")
-    if style_flags:
-        summary += f"\nSTYLE DETAILS: {' | '.join(style_flags)}\n"
-
-    summary += f"""
-── BODY MEASUREMENTS ──
-Bust:   {m.bust:>6.1f} cm
-Waist:  {m.waist:>6.1f} cm
-Hip:    {m.hip:>6.1f} cm
-"""
-    if m.shoulder_width: summary += f"Shoulder: {m.shoulder_width:>5.1f} cm\n"
-    if m.back_length: summary += f"Back Length: {m.back_length:>4.1f} cm\n"
-    if m.sleeve_length: summary += f"Sleeve Length: {m.sleeve_length:>2.1f} cm\n"
-    if m.armhole_depth: summary += f"Armhole Depth: {m.armhole_depth:>2.1f} cm\n"
-
-    if style.measurements_table:
-        summary += "\n── RAW MEASUREMENT SHEET ──\n"
-        for k, v in style.measurements_table.items():
-            summary += f"  {k}: {v}\n"
-
-    summary += f"""
-── DRAFTING COMPUTATIONS ──
-Quarter Bust (w/ ease):  {engine.quarter_bust:.1f} cm
-Quarter Waist (w/ ease): {engine.quarter_waist:.1f} cm
-Quarter Hip (w/ ease):   {engine.quarter_hip:.1f} cm
-Armhole Depth (w/ ease): {engine.armhole_depth:.1f} cm
-Neck Width:              {engine.neck_width:.1f} cm
-Shoulder Length:         {engine.shoulder_length:.1f} cm
-Bust Dart Intake:        {engine.bust_dart:.1f} cm
-Front Waist Dart:        {engine.front_waist_dart:.1f} cm
-Back Waist Dart:         {engine.back_waist_dart:.1f} cm
-
-── PATTERN PIECES ──
-"""
-    pieces = engine.draft(garment_type)
-    for p in pieces:
-        summary += f"  • {p.name} — CUT {p.cut_qty} ({p.piece_type})\n"
-        if p.darts: summary += f"    Darts: {len(p.darts)}\n"
-        if p.notches: summary += f"    Notches: {len(p.notches)}\n"
-        if p.gather_guides: summary += f"    Gather guides: {len(p.gather_guides)}\n"
-        if p.pleat_guides: summary += f"    Pleat guides: {len(p.pleat_guides)}\n"
-        if p.grainline: summary += f"    Grainline: {p.grainline.get('direction', 'vertical')}\n"
-
-    summary += f"""
-── CONSTRUCTION NOTES ──
-• Curved edges (armhole/neckline/sleeve cap) drafted with true Bezier interpolation
-• Seam allowance: {config.SEAM_ALLOWANCE}cm on all edges
-• Hem allowance: {config.HEM_ALLOWANCE}cm
-• AAMA DXF layers: 1=Cut, 8=Seam, 4=Internal/Grainline, 3=Notches
-• Fold/gather/pleat guides included where the style requires them
-
-Ready to draft? Reply /confirm to generate the DXF file + blueprint preview.
-"""
-    return summary
+    Parameters
+    ----------
+    pieces : list of PatternPiece
+        Pattern pieces to export.
+    filepath : str
+        Output DXF file path.
+    measurements_dict : dict
+        Measurement values for the reference table.
+    style : StyleDetails, optional
+        Style details for the reference table.
+    """
+    exporter = DXFExporter()
+    exporter.export(pieces, filepath, measurements_dict, style)
 
 
-# ====================================================================
-# CLI ENTRY POINT (for testing)
-# ====================================================================
+def generate_pattern(measurements_data: dict, garment_type: str,
+                     ease: str = 'standard',
+                     style_data: Optional[dict] = None) -> dict:
+    """Convenience function: generate a complete pattern from raw data.
+
+    Parameters
+    ----------
+    measurements_data : dict
+        Dictionary of measurement key -> value.
+    garment_type : str
+        Garment type to draft.
+    ease : str
+        Ease level.
+    style_data : dict, optional
+        Dictionary of style parameters.
+
+    Returns
+    -------
+    dict
+        Dictionary with keys:
+            - 'pieces': list of piece dictionaries (via to_dict())
+            - 'measurements': the Measurements object
+            - 'style': the StyleDetails object
+            - 'engine': the DraftingEngine instance
+            - 'piece_count': number of pieces
+    """
+    measurements = Measurements()
+    for key, value in measurements_data.items():
+        if hasattr(measurements, key):
+            try:
+                setattr(measurements, key, float(value))
+            except (ValueError, TypeError):
+                setattr(measurements, key, value)
+
+    style = StyleDetails()
+    if style_data:
+        for key, value in style_data.items():
+            if hasattr(style, key):
+                setattr(style, key, value)
+
+    pieces, engine = draft_pieces(measurements, garment_type, ease, style)
+
+    return {
+        'pieces': [p.to_dict() for p in pieces],
+        'measurements': measurements,
+        'style': style,
+        'engine': engine,
+        'piece_count': len(pieces),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Utility: add seam allowance to a piece
+# ---------------------------------------------------------------------------
+
+def add_seam_allowance(piece: PatternPiece, allowance: float = SEAM_ALLOWANCE,
+                       add_hem: bool = True,
+                       hem_allowance: float = HEM_ALLOWANCE) -> PatternPiece:
+    """Return a new PatternPiece with seam allowance added as an offset
+    polyline.  If *add_hem* is True, the bottom (lowest-y) edge is extended
+    by *hem_allowance*.
+    """
+    offset_pts = _offset_polyline(piece.points, allowance)
+
+    if add_hem and offset_pts:
+        min_y = min(p.y for p in offset_pts)
+        for i, pt in enumerate(offset_pts):
+            if abs(pt.y - min_y) < 0.5:
+                offset_pts[i] = Point(pt.x, pt.y - hem_allowance)
+
+    new_piece = PatternPiece(
+        name=piece.name + " (with SA)",
+        points=offset_pts,
+        curves=piece.curves,
+        darts=piece.darts,
+        notches=piece.notches,
+        grainline=piece.grainline,
+        label=piece.label,
+        cut_quantity=piece.cut_quantity,
+        layer=piece.layer,
+    )
+    return new_piece
+
+
+# ---------------------------------------------------------------------------
+# Module entry point
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    m = Measurements(
-        bust=92, waist=72, hip=96,
-        shoulder_width=38, back_length=40,
-        sleeve_length=58, armhole_depth=22,
-        skirt_length=60, dress_length=100,
+    result = generate_pattern(
+        {"bust": 88, "waist": 68, "hip": 94, "shoulder_width": 38,
+         "back_length": 40, "sleeve_length": 56},
+        "dress",
+        "standard",
+        {"silhouette": "fitted", "has_darts": True, "has_notches": True,
+         "size_label": "M"},
     )
-    style = StyleDetails(
-        silhouette="wrap", has_cowl=True, has_gathers=True,
-        gather_locations=["front neckline"], asymmetric_hem=True,
-        size_label="S",
-    )
-    print("=== ASYMMETRIC/COWL TOP PATTERN GENERATION ===\n")
-    print(generate_spec_summary(m, "dress", style=style))
-    path = generate_pattern(m, "dress", style=style, output_path="test_cowl_dress.dxf")
-    print(f"\nDXF saved to: {path}")
+    print(f"Generated {result['piece_count']} pattern pieces:")
+    for p in result['pieces']:
+        print(f"  - {p['name']}: {len(p['points'])} points, "
+              f"{len(p['darts'])} darts, {len(p['notches'])} notches")
