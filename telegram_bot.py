@@ -162,6 +162,7 @@ class GeminiClient:
             "generationConfig": {
                 "maxOutputTokens": 2000,
                 "temperature": 0.05,
+                "thinkingConfig": {"thinkingBudget": config.GEMINI_THINKING_BUDGET},
             },
         }
         url = f"{self.base_url}?key={self.api_key}"
