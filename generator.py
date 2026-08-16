@@ -933,14 +933,14 @@ class DXFExporter:
 
     def _setup_layers(self, doc):
         layer_defs = [
-            (self.layers["CUT"], 1),
-            (self.layers["SEAM"], 5),
-            (self.layers["GRAIN"], 3),
-            (self.layers["NOTCH"], 2),
-            (self.layers["INTERNAL"], 6),
-            (self.layers["REFERENCE"], 8),
-            (self.layers["ANNOTATION"], 7),
-            (self.layers["MIRROR"], 4),
+            (self.layers.get("CUT", "1"), 1),
+            (self.layers.get("SEAM", "8"), 5),
+            (self.layers.get("GRAIN", "4"), 3),
+            (self.layers.get("NOTCH", "3"), 2),
+            (self.layers.get("INTERNAL", "4"), 6),
+            (self.layers.get("REFERENCE", "6"), 8),
+            (self.layers.get("ANNOTATION", "7"), 7),
+            (self.layers.get("MIRROR", "9"), 4),
         ]
         for name, color in layer_defs:
             if name not in doc.layers:
@@ -971,7 +971,7 @@ class DXFExporter:
             pts = [self._xy(p, ox, oy) for p in full_pts]
             pts.append(pts[0])
             msp.add_lwpolyline(pts, dxfattribs={
-                "layer": self.layers["CUT"],
+                "layer": self.layers.get("CUT", "1"),
                 "linetype": "CONTINUOUS",
                 "lineweight": 35,
             })
@@ -981,7 +981,7 @@ class DXFExporter:
             pts = [self._xy(p, ox, oy) for p in piece.seam_line]
             pts.append(pts[0])
             msp.add_lwpolyline(pts, dxfattribs={
-                "layer": self.layers["SEAM"],
+                "layer": self.layers.get("SEAM", "8"),
                 "linetype": "DASHED",
             })
 
@@ -992,14 +992,14 @@ class DXFExporter:
                 sx, sy = self._xy(start, ox, oy)
                 ex, ey = self._xy(end, ox, oy)
                 ax, ay = self._xy(apex, ox, oy)
-                msp.add_line((sx, sy), (ax, ay), dxfattribs={"layer": self.layers["INTERNAL"]})
-                msp.add_line((ex, ey), (ax, ay), dxfattribs={"layer": self.layers["INTERNAL"]})
+                msp.add_line((sx, sy), (ax, ay), dxfattribs={"layer": self.layers.get("INTERNAL", "4")})
+                msp.add_line((ex, ey), (ax, ay), dxfattribs={"layer": self.layers.get("INTERNAL", "4")})
 
         # --- Notches ---
         for notch in piece.notches:
             nx, ny = self._xy(notch, ox, oy)
-            msp.add_line((nx - 0.5, ny), (nx + 0.5, ny), dxfattribs={"layer": self.layers["NOTCH"]})
-            msp.add_line((nx, ny - 0.5), (nx, ny + 0.5), dxfattribs={"layer": self.layers["NOTCH"]})
+            msp.add_line((nx - 0.5, ny), (nx + 0.5, ny), dxfattribs={"layer": self.layers.get("NOTCH", "3")})
+            msp.add_line((nx, ny - 0.5), (nx, ny + 0.5), dxfattribs={"layer": self.layers.get("NOTCH", "3")})
 
         # --- Grainline with directional arrows ---
         if piece.grainline:
@@ -1008,7 +1008,7 @@ class DXFExporter:
             if start and end:
                 sx, sy = self._xy(start, ox, oy)
                 ex, ey = self._xy(end, ox, oy)
-                msp.add_line((sx, sy), (ex, ey), dxfattribs={"layer": self.layers["GRAIN"], "linetype": "PHANTOM"})
+                msp.add_line((sx, sy), (ex, ey), dxfattribs={"layer": self.layers.get("GRAIN", "4"), "linetype": "PHANTOM"})
                 angle = math.atan2(ey - sy, ex - sx)
                 arrow_size = 1.5
                 for tip, base_angle in [((sx, sy), angle + math.pi), ((ex, ey), angle)]:
@@ -1016,9 +1016,9 @@ class DXFExporter:
                         ang = base_angle + ang_off
                         msp.add_line(tip, (tip[0] + arrow_size * math.cos(ang),
                                            tip[1] + arrow_size * math.sin(ang)),
-                                    dxfattribs={"layer": self.layers["GRAIN"]})
+                                    dxfattribs={"layer": self.layers.get("GRAIN", "4")})
                 msp.add_text("GRAINLINE", dxfattribs={
-                    "layer": self.layers["ANNOTATION"], "height": 0.9,
+                    "layer": self.layers.get("ANNOTATION", "7"), "height": 0.9,
                 }).set_placement(((sx + ex) / 2 + 1, (sy + ey) / 2))
 
         # --- Internal reference lines ---
@@ -1028,7 +1028,7 @@ class DXFExporter:
                 for i in range(len(pts) - 1):
                     p1x, p1y = self._xy(pts[i], ox, oy)
                     p2x, p2y = self._xy(pts[i + 1], ox, oy)
-                    msp.add_line((p1x, p1y), (p2x, p2y), dxfattribs={"layer": self.layers["REFERENCE"]})
+                    msp.add_line((p1x, p1y), (p2x, p2y), dxfattribs={"layer": self.layers.get("REFERENCE", "6")})
 
         # --- Fold lines ---
         for fl in piece.fold_lines:
@@ -1037,7 +1037,7 @@ class DXFExporter:
                 p1x, p1y = self._xy(pts[0], ox, oy)
                 p2x, p2y = self._xy(pts[1], ox, oy)
                 msp.add_line((p1x, p1y), (p2x, p2y), dxfattribs={
-                    "layer": self.layers["MIRROR"], "linetype": "DASHDOT",
+                    "layer": self.layers.get("MIRROR", "9"), "linetype": "DASHDOT",
                 })
 
         # --- Gather guides (radiating fold/ease lines) ---
@@ -1047,11 +1047,11 @@ class DXFExporter:
                 p1x, p1y = self._xy(pts[0], ox, oy)
                 p2x, p2y = self._xy(pts[1], ox, oy)
                 msp.add_line((p1x, p1y), (p2x, p2y), dxfattribs={
-                    "layer": self.layers["INTERNAL"], "linetype": "DASHED",
+                    "layer": self.layers.get("INTERNAL", "4"), "linetype": "DASHED",
                 })
                 if gg.get("label"):
                     msp.add_text(gg["label"], dxfattribs={
-                        "layer": self.layers["ANNOTATION"], "height": 0.8,
+                        "layer": self.layers.get("ANNOTATION", "7"), "height": 0.8,
                     }).set_placement((p2x, p2y))
 
         # --- Pleat guides ---
@@ -1061,7 +1061,7 @@ class DXFExporter:
                 p1x, p1y = self._xy(pts[0], ox, oy)
                 p2x, p2y = self._xy(pts[1], ox, oy)
                 msp.add_line((p1x, p1y), (p2x, p2y), dxfattribs={
-                    "layer": self.layers["INTERNAL"], "linetype": "DASHDOT2",
+                    "layer": self.layers.get("INTERNAL", "4"), "linetype": "DASHDOT2",
                 })
 
         # --- Mirror axis (CF/CB) ---
@@ -1070,7 +1070,7 @@ class DXFExporter:
             if s and e:
                 sx, sy = self._xy(s, ox, oy)
                 ex, ey = self._xy(e, ox, oy)
-                msp.add_line((sx, sy), (ex, ey), dxfattribs={"layer": self.layers["MIRROR"], "linetype": "CENTER"})
+                msp.add_line((sx, sy), (ex, ey), dxfattribs={"layer": self.layers.get("MIRROR", "9"), "linetype": "CENTER"})
 
         # --- Annotations ---
         for ann in piece.annotations:
@@ -1078,7 +1078,7 @@ class DXFExporter:
             text = ann.get("text", "")
             px, py = self._xy(pos, ox, oy)
             msp.add_text(text, dxfattribs={
-                "layer": self.layers["ANNOTATION"], "height": 1.5,
+                "layer": self.layers.get("ANNOTATION", "7"), "height": 1.5,
             }).set_placement((px, py))
 
         # --- Piece name / cut qty / size label block ---
@@ -1088,7 +1088,7 @@ class DXFExporter:
             if size_label:
                 cut_text += f" - SIZE {size_label}"
             msp.add_text(cut_text, dxfattribs={
-                "layer": self.layers["ANNOTATION"], "height": 1.1,
+                "layer": self.layers.get("ANNOTATION", "7"), "height": 1.1,
             }).set_placement((label_pt[0], label_pt[1] + 3))
 
     def _add_header(self, msp, garment_type: str,
