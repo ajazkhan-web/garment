@@ -9,8 +9,8 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 
 # --- OpenRouter ---
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1/chat/completions"
-OPENROUTER_MODEL = "anthropic/claude-3.5-sonnet"  # multimodal-capable
-OPENROUTER_VISION_MODEL = "anthropic/claude-3.5-sonnet"
+OPENROUTER_MODEL = "anthropic/claude-sonnet-4"  # multimodal-capable, valid OpenRouter model
+OPENROUTER_VISION_MODEL = "anthropic/claude-sonnet-4"
 
 # --- Bot Mode ---
 BOT_MODE = os.environ.get("BOT_MODE", "polling")  # "polling" or "webhook"
