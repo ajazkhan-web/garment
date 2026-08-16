@@ -153,7 +153,9 @@ class GeminiClient:
         self.timeout = 120.0
 
     async def _call(self, system_prompt: str, user_parts: list) -> str:
-        """Call Gemini generateContent API. user_parts = list of part dicts."""
+        """Call Gemini generateContent API. user_parts = list of part dicts.
+        Retries on 429/502/503 with exponential backoff (up to 4 attempts)."""
+        import asyncio as _aio
         payload = {
             "contents": [{
                 "role": "user",
@@ -166,32 +168,41 @@ class GeminiClient:
             },
         }
         url = f"{self.base_url}?key={self.api_key}"
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            resp = await client.post(url, json=payload, headers={"Content-Type": "application/json"})
-            if resp.status_code == 403:
-                logger.error(f"Gemini 403 Forbidden: {resp.text[:300]}")
-                raise RuntimeError(
-                    "Google API key rejected (403 Forbidden). Ensure the Generative Language API is enabled "
-                    "in Google Cloud Console and your API key has access."
-                )
-            if resp.status_code == 429:
-                logger.error(f"Gemini rate limited (429): {resp.text[:300]}")
-                raise RuntimeError(
-                    "Gemini free-tier rate limit reached (429). Wait a minute and try again."
-                )
-            if resp.status_code >= 400:
-                logger.error(f"Gemini HTTP {resp.status_code}: {resp.text[:500]}")
-            resp.raise_for_status()
-            data = resp.json()
-        # Extract text from Gemini response
-        candidates = data.get("candidates", [])
-        if not candidates:
-            raise ValueError("Gemini returned no candidates. The image may be too large or unclear.")
-        parts = candidates[0].get("content", {}).get("parts", [])
-        text = "".join(p.get("text", "") for p in parts)
-        if not text:
-            raise ValueError("Gemini returned empty response.")
-        return text
+        last_error = None
+        for attempt in range(4):
+            if attempt > 0:
+                wait = min(5 * (2 ** (attempt - 1)), 30)  # 5s, 10s, 20s
+                logger.info(f"Gemini retry {attempt+1}/4 — waiting {wait}s...")
+                await _aio.sleep(wait)
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                resp = await client.post(url, json=payload, headers={"Content-Type": "application/json"})
+                if resp.status_code == 403:
+                    logger.error(f"Gemini 403 Forbidden: {resp.text[:300]}")
+                    raise RuntimeError(
+                        "Google API key rejected (403 Forbidden). Ensure the Generative Language API is enabled "
+                        "in Google Cloud Console and your API key has access."
+                    )
+                if resp.status_code in (429, 502, 503):
+                    logger.warning(f"Gemini HTTP {resp.status_code} (attempt {attempt+1}/4): {resp.text[:200]}")
+                    last_error = resp
+                    continue  # retry with backoff
+                if resp.status_code >= 400:
+                    logger.error(f"Gemini HTTP {resp.status_code}: {resp.text[:500]}")
+                resp.raise_for_status()
+                data = resp.json()
+                # Extract text from Gemini response
+                candidates = data.get("candidates", [])
+                if not candidates:
+                    raise ValueError("Gemini returned no candidates. The image may be too large or unclear.")
+                parts = candidates[0].get("content", {}).get("parts", [])
+                text = "".join(p.get("text", "") for p in parts)
+                if not text:
+                    raise ValueError("Gemini returned empty response.")
+                return text
+        # All retries exhausted
+        if last_error is not None:
+            raise RuntimeError(f"Gemini unavailable after 4 attempts (last: HTTP {last_error.status_code}). Try again in a minute.")
+        raise RuntimeError("Gemini call failed after retries.")
 
     @staticmethod
     def _strip_fences(content: str) -> str:
