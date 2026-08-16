@@ -449,13 +449,8 @@ def generate_dxf(pieces: Dict[str, Any], output_path: str, title: str = "PATTERN
         # Offset points
         pts_off = [(x + offset_x, y) for x, y in pts]
 
-        # Smooth curved silhouette pieces (Catmull-Rom) for a professional draft look.
-        # Rectangular trim pieces (bands/cuffs/waistbands/collars with 4 corners) stay sharp.
-        do_smooth = piece_data.get("smooth", len(pts_off) > 4)
-        outline_pts = smooth_points(pts_off, smoothness=10) if do_smooth else pts_off
-
         # Piece outline (layer 1 = boundary)
-        blk.add_lwpolyline(outline_pts, dxfattribs={"layer": "1"}, close=True)
+        blk.add_lwpolyline(pts_off, dxfattribs={"layer": "1"}, close=True)
 
         # Grain line (layer 7, vertical center)
         cx = sum(p[0] for p in pts_off) / len(pts_off)
@@ -559,9 +554,7 @@ def generate_svg(pieces: Dict[str, Any], output_path: str, title: str = "Pattern
         pts = pd["points"]
         off = offsets[name]
         color = colors[i % len(colors)]
-        shifted_raw = [(x + off, y) for x, y in pts]
-        do_smooth = pd.get("smooth", len(shifted_raw) > 4)
-        shifted = smooth_points(shifted_raw, smoothness=10) if do_smooth else shifted_raw
+        shifted = [(x + off, y) for x, y in pts]
 
         path_str = " ".join(f"{tx(x):.1f},{ty(y):.1f}" for x, y in shifted)
         lines.append(f'<polygon points="{path_str}" fill="{color}33" stroke="{color}" stroke-width="2"/>')
