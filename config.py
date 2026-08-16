@@ -1,54 +1,47 @@
 """
-Configuration module — centralises env vars, constants, and shared settings.
+config.py — Configuration for the Apparel Pattern Drafting Bot.
+Supports dual AI providers: Google Gemini (primary, free) + OpenRouter (fallback).
 """
 import os
 
-# --- API Keys (from secrets / env) ---
-OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+# ─── Telegram ───
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 
-# --- OpenRouter ---
-OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1/chat/completions"
-OPENROUTER_MODEL = "anthropic/claude-sonnet-4"  # multimodal-capable, valid OpenRouter model
+# ─── AI Provider Selection ───
+# Primary: Google Gemini (free tier, multimodal)
+GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "")
+GEMINI_MODEL = "gemini-2.5-flash"          # fast, free tier, multimodal
+GEMINI_VISION_MODEL = "gemini-2.5-flash"   # same model handles text+image
+
+# Fallback: OpenRouter (Claude Sonnet 4, paid)
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+OPENROUTER_MODEL = "anthropic/claude-sonnet-4"
 OPENROUTER_VISION_MODEL = "anthropic/claude-sonnet-4"
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1/chat/completions"
 
-# --- Bot Mode ---
-BOT_MODE = os.environ.get("BOT_MODE", "polling")  # "polling" or "webhook"
+# ─── Which provider to use ───
+# If GOOGLE_API_KEY is set, use Gemini (free). Otherwise use OpenRouter.
+USE_GEMINI = bool(GOOGLE_API_KEY)
 
-# --- Paths ---
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-CACHE_DIR = os.path.join(BASE_DIR, "cache")
-TEMPLATE_DIR = os.path.join(BASE_DIR, "templates")
-OUTPUT_DIR = os.path.join(BASE_DIR, "output")
-DATABASE_PATH = os.path.join(BASE_DIR, "data", "templates.db")
-
-# --- Ensure dirs exist ---
-for d in (CACHE_DIR, TEMPLATE_DIR, OUTPUT_DIR, os.path.dirname(DATABASE_PATH)):
-    os.makedirs(d, exist_ok=True)
-
-# --- Drafting Constants ---
-EASE_BODICE = {
-    "minimal": 2.0,   # cm
-    "standard": 4.0,
-    "loose": 6.0,
-}
-EASE_SKIRT = {
-    "minimal": 2.0,
-    "standard": 3.0,
-    "loose": 5.0,
-}
-SEAM_ALLOWANCE = 1.0   # cm default (~0.5in noted in annotations)
-HEM_ALLOWANCE = 2.5     # cm default
-
-# AAMA DXF Layer standard, per spec:
-# 1 = Cut lines, 8 = Seam lines, 4 = Internal/Grainline, 3 = Notches
+# ─── AAMA DXF Layer Standards ───
 AAMA_LAYERS = {
-    "CUT":           "1",    # Cutting outline
-    "SEAM":          "8",    # Seam lines (inside SA)
-    "GRAIN":         "4",    # Grainlines (shares Internal layer per spec)
-    "NOTCH":         "3",    # Notches / balance points
-    "INTERNAL":      "4",    # Internal lines (darts, fold/gather guides)
-    "REFERENCE":     "6",    # Reference / construction lines (hip line, elbow line)
-    "ANNOTATION":    "7",    # Text annotations (piece name, size, cut qty)
-    "MIRROR":        "9",    # Mirror / fold lines (CF/CB)
+    1: {"name": "CUT",      "color": 7,   "desc": "Main cut outline"},
+    3: {"name": "INTERNAL", "color": 3,   "desc": "Internal lines (darts, gathers)"},
+    4: {"name": "SEAM",     "color": 5,   "desc": "Seam allowances / stitching lines"},
+    8: {"name": "ANNOT",    "color": 2,   "desc": "Annotations, text, grainlines"},
 }
+
+# ─── Pattern Defaults ───
+DEFAULT_EASE = "standard"
+EASE_VALUES = {
+    "minimal":  2.0,
+    "standard": 4.0,
+    "loose":    8.0,
+}
+
+# ─── Template Database ───
+TEMPLATE_DB_PATH = os.environ.get("TEMPLATE_DB_PATH", "templates.db")
+
+# ─── Bot Settings ───
+BOT_MODE = os.environ.get("BOT_MODE", "polling")
+MAX_SESSION_MINUTES = 30
