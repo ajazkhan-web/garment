@@ -9,7 +9,8 @@ import os
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 
 # ─── AI Provider (Google Gemini ONLY) ───
-GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "")
+# Try GOOGLE_API_KEY_2 first (latest key), fall back to GOOGLE_API_KEY
+GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY_2", "") or os.environ.get("GOOGLE_API_KEY", "")
 GEMINI_MODEL = "gemini-2.5-flash"          # fast, free tier, multimodal
 GEMINI_VISION_MODEL = "gemini-2.5-flash"   # same model handles text+image
 
