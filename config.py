@@ -31,7 +31,16 @@ AAMA_LAYERS = {
     8: {"name": "ANNOT",    "color": 2,   "desc": "Annotations, text, grainlines"},
 }
 
-# ─── Pattern Defaults ───
+# ─── Pattern Drafting Constants ───
+SEAM_ALLOWANCE = 1.0       # cm
+HEM_ALLOWANCE = 2.5        # cm
+OUTPUT_DIR = os.path.join(os.getcwd(), "output")
+DATABASE_PATH = os.path.join(os.getcwd(), "data", "templates.db")
+
+# ─── Ease Values ───
+EASE_BODICE = {"minimal": 2.0, "standard": 4.0, "loose": 6.0}
+EASE_SKIRT = {"minimal": 2.0, "standard": 3.0, "loose": 5.0}
+
 DEFAULT_EASE = "standard"
 EASE_VALUES = {
     "minimal":  2.0,
