@@ -1,564 +1,627 @@
-import os
+# generator.py
+
+import json
 import math
+import sqlite3
+from pathlib import Path
+from typing import Dict, List, Tuple, Optional
+
 import ezdxf
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib.patches import Polygon as MplPolygon
 
 
 # ============================================================
-# GARMENT AI PATTERN GENERATOR
+# DIRECTORIES / DATABASE
 # ============================================================
-#
-# Input:
-#   AI extracted garment measurements
-#
-# Output:
-#   DXF technical pattern
-#   PNG technical preview
-#
-# NOTE:
-# This is an automated drafting engine.
-# Production patterns should be checked by a pattern technician.
+
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR / "pattern_data"
+DB_PATH = DATA_DIR / "patterns.db"
+
+ORIGINAL_DXF_DIR = DATA_DIR / "original_dxf"
+GENERATED_DXF_DIR = DATA_DIR / "generated_dxf"
+PREVIEW_DIR = DATA_DIR / "previews"
+
+for directory in [
+    DATA_DIR,
+    ORIGINAL_DXF_DIR,
+    GENERATED_DXF_DIR,
+    PREVIEW_DIR,
+]:
+    directory.mkdir(parents=True, exist_ok=True)
+
+
 # ============================================================
+# DATABASE
+# ============================================================
+
+def init_database():
+    conn = sqlite3.connect(DB_PATH)
+
+    cur = conn.cursor()
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS patterns (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            pattern_name TEXT,
+            garment_type TEXT,
+            size TEXT,
+            unit TEXT,
+            measurements_json TEXT,
+            plan_json TEXT,
+            original_dxf TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS pattern_pieces (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            pattern_id INTEGER,
+            piece_name TEXT,
+            piece_type TEXT,
+            geometry_json TEXT,
+            FOREIGN KEY(pattern_id)
+            REFERENCES patterns(id)
+        )
+    """)
+
+    conn.commit()
+    conn.close()
+
+
+init_database()
 
 
 # ============================================================
 # BASIC HELPERS
 # ============================================================
 
-def to_float(value, default=None):
-    """
-    Safely convert a value to float.
-
-    Supports:
-        23
-        "23"
-        "2 1/2"
-        "3/4"
-        "23.5"
-    """
-
+def safe_float(value, default=None):
     if value is None:
         return default
 
-    if isinstance(value, (int, float)):
+    try:
+        if isinstance(value, str):
+            value = value.strip()
+
+            # fractions
+            if "/" in value and " " in value:
+                parts = value.split()
+
+                whole = float(parts[0])
+                a, b = parts[1].split("/")
+
+                return whole + float(a) / float(b)
+
+            if "/" in value:
+                a, b = value.split("/")
+                return float(a) / float(b)
+
         return float(value)
-
-    text = str(value).strip()
-
-    if not text:
-        return default
-
-    # Simple decimal
-    try:
-        return float(text)
-    except ValueError:
-        pass
-
-    # Mixed fraction e.g. 2 1/2
-    parts = text.replace('"', '').split()
-
-    try:
-
-        if len(parts) == 2 and "/" in parts[1]:
-
-            whole = float(parts[0])
-            numerator, denominator = parts[1].split("/")
-
-            return whole + (
-                float(numerator) / float(denominator)
-            )
-
-        # Simple fraction e.g. 3/4
-        if "/" in text:
-
-            numerator, denominator = text.split("/")
-
-            return (
-                float(numerator)
-                / float(denominator)
-            )
 
     except Exception:
         return default
 
-    return default
+
+def clean_name(value):
+    return (
+        str(value or "garment")
+        .strip()
+        .replace(" ", "_")
+        .replace("/", "_")
+        .replace("\\", "_")
+    )
+
+
+def midpoint(a, b):
+    return (
+        (a[0] + b[0]) / 2,
+        (a[1] + b[1]) / 2,
+    )
+
+
+def distance(a, b):
+    return math.sqrt(
+        (a[0] - b[0]) ** 2 +
+        (a[1] - b[1]) ** 2
+    )
+
+
+def bezier_quadratic(p0, p1, p2, steps=20):
+
+    result = []
+
+    for i in range(steps + 1):
+
+        t = i / steps
+
+        x = (
+            (1 - t) ** 2 * p0[0]
+            + 2 * (1 - t) * t * p1[0]
+            + t ** 2 * p2[0]
+        )
+
+        y = (
+            (1 - t) ** 2 * p0[1]
+            + 2 * (1 - t) * t * p1[1]
+            + t ** 2 * p2[1]
+        )
+
+        result.append((x, y))
+
+    return result
+
+
+def add_polygon(doc, name, points, layer="PATTERN"):
+
+    if not points:
+        return
+
+    layer_name = layer.upper()
+
+    if layer_name not in doc.layers:
+        doc.layers.add(layer_name)
+
+    msp = doc.modelspace()
+
+    msp.add_lwpolyline(
+        points,
+        close=True,
+        dxfattribs={
+            "layer": layer_name
+        }
+    )
+
+
+def add_line(doc, p1, p2, layer="INTERNAL"):
+
+    if layer.upper() not in doc.layers:
+        doc.layers.add(layer.upper())
+
+    doc.modelspace().add_line(
+        p1,
+        p2,
+        dxfattribs={
+            "layer": layer.upper()
+        }
+    )
+
+
+def add_text(doc, text, position, height=0.35):
+
+    doc.modelspace().add_text(
+        str(text),
+        dxfattribs={
+            "height": height
+        }
+    ).set_placement(position)
 
 
 # ============================================================
-# UNIT CONVERSION
+# MEASUREMENT NORMALIZATION
 # ============================================================
 
-def convert_to_inches(value, unit="in"):
+def normalize_measurements(spec):
 
-    value = to_float(value)
+    m = spec.get("measurements", {})
 
-    if value is None:
+    # Current bot sends both nested and flat values,
+    # but this also works with either format.
+
+    def get(name, *aliases):
+
+        value = m.get(name)
+
+        if value is not None:
+            return safe_float(value)
+
+        for alias in aliases:
+
+            value = m.get(alias)
+
+            if value is not None:
+                return safe_float(value)
+
+        value = spec.get(name)
+
+        if value is not None:
+            return safe_float(value)
+
+        for alias in aliases:
+
+            value = spec.get(alias)
+
+            if value is not None:
+                return safe_float(value)
+
         return None
 
-    unit = str(unit).lower().strip()
-
-    if unit in ["cm", "centimeter", "centimeters"]:
-        return value / 2.54
-
-    if unit in ["mm", "millimeter", "millimeters"]:
-        return value / 25.4
-
-    return value
-
-
-def convert_to_cm(value, unit="in"):
-
-    value = to_float(value)
-
-    if value is None:
-        return None
-
-    unit = str(unit).lower().strip()
-
-    if unit in ["in", "inch", "inches", '"']:
-        return value * 2.54
-
-    if unit in ["mm", "millimeter", "millimeters"]:
-        return value / 10
-
-    return value
-
-
-# ============================================================
-# BEZIER CURVE
-# ============================================================
-
-def generate_curve(
-    p0,
-    p1,
-    p2,
-    num_pts=20
-):
-    """
-    Quadratic Bezier curve.
-    """
-
-    t = np.linspace(
-        0,
-        1,
-        num_pts
+    chest = get("chest", "bust")
+    waist = get("waist")
+    hip = get("hip")
+    length = get(
+        "length",
+        "length_from_hps"
+    )
+    shoulder = get("shoulder")
+    armhole = get("armhole")
+    sleeve = get(
+        "sleeve_length",
+        "sleeve_length_from_neck_seam"
     )
 
-    curve = []
+    # Conservative fallbacks.
+    # These are drafting defaults, not claimed measurements.
 
-    for ti in t:
+    if chest is None:
+        chest = 36.0
 
-        point = (
-            (1 - ti) ** 2 * np.array(p0)
-            +
-            2 * (1 - ti) * ti * np.array(p1)
-            +
-            ti ** 2 * np.array(p2)
-        )
+    if waist is None:
+        waist = chest * 0.80
 
-        curve.append(
-            (
-                float(point[0]),
-                float(point[1])
-            )
-        )
+    if hip is None:
+        hip = chest * 1.05
 
-    return curve
+    if length is None:
+        length = 28.0
 
+    if shoulder is None:
+        shoulder = chest * 0.36
 
-# ============================================================
-# MEASUREMENT EXTRACTION
-# ============================================================
+    if armhole is None:
+        armhole = chest * 0.18
 
-def normalize_measurements(spec_data):
+    if sleeve is None:
+        sleeve = 23.0
 
-    unit = spec_data.get(
-        "unit",
-        "in"
-    )
-
-    measurements = spec_data.get(
-        "measurements",
-        {}
-    )
-
-    # Support both:
-    #
-    # measurements: {...}
-    #
-    # AND old format:
-    #
-    # chest, waist, length...
-
-    def get_measurement(
-        new_name,
-        old_names=(),
-        default=None
-    ):
-
-        value = measurements.get(
-            new_name
-        )
-
-        if value is None:
-
-            for name in old_names:
-
-                if spec_data.get(name) is not None:
-
-                    value = spec_data.get(name)
-
-                    break
-
-        return convert_to_inches(
-            value,
-            unit
-        ) if value is not None else default
-
-    data = {
-
-        "length":
-            get_measurement(
-                "length_from_hps",
-                ["length"],
-                30
-            ),
-
-        "chest":
-            get_measurement(
-                "chest",
-                [],
-                36
-            ),
-
-        "waist":
-            get_measurement(
-                "waist",
-                [],
-                30
-            ),
-
-        "hip":
-            get_measurement(
-                "hip",
-                [],
-                38
-            ),
-
-        "shoulder":
-            get_measurement(
-                "shoulder",
-                [],
-                14
-            ),
-
-        "sleeve":
-            get_measurement(
-                "sleeve_length_from_neck_seam",
-                ["sleeve_length"],
-                20
-            ),
-
-        "neck_width":
-            get_measurement(
-                "boat_neck_width",
-                [],
-                7
-            ),
-
-        "front_neck_drop":
-            get_measurement(
-                "front_neck_drop",
-                [],
-                3
-            ),
-
-        "back_neck_drop":
-            get_measurement(
-                "back_neck_drop",
-                [],
-                1
-            ),
-
-        "sleeve_opening":
-            get_measurement(
-                "sleeve_opening_fabric_flat",
-                [],
-                8
-            ),
-
-        "sleeve_cuff_height":
-            get_measurement(
-                "sleeve_opening_full_height",
-                [],
-                1
-            ),
+    return {
+        "chest": chest,
+        "waist": waist,
+        "hip": hip,
+        "length": length,
+        "shoulder": shoulder,
+        "armhole": armhole,
+        "sleeve_length": sleeve,
     }
 
-    return data
-
 
 # ============================================================
-# PATTERN SETTINGS
+# PATTERN PLANNER
 # ============================================================
 
-class PatternSettings:
+def build_pattern_plan(spec):
 
-    def __init__(
-        self,
-        seam_allowance=0.5,
-        hem_allowance=1.0,
-        scale=1.0
+    garment = (
+        str(
+            spec.get(
+                "garment_type",
+                ""
+            )
+        )
+        .lower()
+    )
+
+    styles = " ".join(
+        spec.get(
+            "style_details",
+            []
+        )
+    ).lower()
+
+    construction = " ".join(
+        spec.get(
+            "construction_details",
+            []
+        )
+    ).lower()
+
+    text = (
+        garment
+        + " "
+        + styles
+        + " "
+        + construction
+    )
+
+    pieces = []
+
+    if any(
+        x in text
+        for x in [
+            "t-shirt",
+            "tee",
+            "tshirt"
+        ]
     ):
 
-        self.seam_allowance = seam_allowance
+        pieces = [
+            "FRONT",
+            "BACK",
+            "SLEEVE",
+            "NECKBAND",
+        ]
 
-        self.hem_allowance = hem_allowance
+        family = "tshirt"
 
-        self.scale = scale
+    elif any(
+        x in text
+        for x in [
+            "shirt",
+            "button",
+            "placket"
+        ]
+    ):
+
+        pieces = [
+            "FRONT",
+            "BACK",
+            "SLEEVE",
+            "COLLAR",
+            "COLLAR_STAND",
+            "CUFF",
+            "PLACKET",
+        ]
+
+        family = "shirt"
+
+    elif any(
+        x in text
+        for x in [
+            "dress",
+            "gown"
+        ]
+    ):
+
+        pieces = [
+            "FRONT_BODICE",
+            "BACK_BODICE",
+            "SLEEVE",
+        ]
+
+        family = "dress"
+
+    elif any(
+        x in text
+        for x in [
+            "top",
+            "blouse"
+        ]
+    ):
+
+        pieces = [
+            "FRONT",
+            "BACK",
+            "SLEEVE",
+        ]
+
+        family = "top"
+
+    else:
+
+        pieces = [
+            "FRONT",
+            "BACK",
+            "SLEEVE",
+        ]
+
+        family = "basic"
+
+    # Add special pieces only when evidence exists.
+
+    if "collar" in text and "COLLAR" not in pieces:
+        pieces.append("COLLAR")
+
+    if "cuff" in text and "CUFF" not in pieces:
+        pieces.append("CUFF")
+
+    if "placket" in text and "PLACKET" not in pieces:
+        pieces.append("PLACKET")
+
+    if "neckband" in text and "NECKBAND" not in pieces:
+        pieces.append("NECKBAND")
+
+    if "pocket" in text:
+        pieces.append("POCKET")
+
+    if "facing" in text:
+        pieces.append("FACING")
+
+    return {
+        "family": family,
+        "pieces": pieces,
+        "style_details": spec.get(
+            "style_details",
+            []
+        ),
+        "construction_details": spec.get(
+            "construction_details",
+            []
+        ),
+    }
 
 
 # ============================================================
-# POINT HELPERS
+# BASIC BODICE
 # ============================================================
 
-def offset_points(
-    points,
-    offset_x=0,
-    offset_y=0
-):
+def make_front(spec):
 
-    return [
-        (
-            float(x + offset_x),
-            float(y + offset_y)
-        )
-        for x, y in points
-    ]
-
-
-def bounds(points):
-
-    xs = [p[0] for p in points]
-
-    ys = [p[1] for p in points]
-
-    return (
-        min(xs),
-        max(xs),
-        min(ys),
-        max(ys)
-    )
-
-
-# ============================================================
-# FRONT BODICE
-# ============================================================
-
-def build_front(
-    m,
-    settings
-):
+    m = normalize_measurements(spec)
 
     chest = m["chest"]
-
     waist = m["waist"]
-
     length = m["length"]
-
     shoulder = m["shoulder"]
+    armhole = m["armhole"]
 
-    armhole = max(
-        7.0,
-        chest / 6.0 + 1.0
+    quarter_chest = chest / 4
+    quarter_waist = waist / 4
+
+    shoulder_half = shoulder / 2
+
+    neck_width = max(
+        2.5,
+        shoulder * 0.28
     )
 
-    # Quarter measurements
-
-    chest_q = chest / 4.0
-
-    waist_q = waist / 4.0
-
-    shoulder_half = shoulder / 2.0
-
-    # Main points
-
-    p0 = (0, 0)
-
-    p1 = (
-        chest_q,
-        0
+    neck_depth = max(
+        2.5,
+        shoulder * 0.35
     )
 
-    p2 = (
-        waist_q,
-        length * 0.50
+    armhole_y = length - armhole
+
+    points = []
+
+    # Center front
+    points.append((0, 0))
+
+    # Hem
+    points.append(
+        (quarter_waist + 2.0, 0)
     )
 
-    p3 = (
-        waist_q,
-        length
+    # Waist
+    points.append(
+        (quarter_waist + 1.5, length * 0.45)
     )
 
-    # Armhole
-
-    arm_start = (
-        chest_q,
-        length - armhole
+    # Armhole base
+    points.append(
+        (quarter_chest + 0.5, armhole_y)
     )
 
-    shoulder_end = (
-        shoulder_half,
-        length - 1.0
-    )
-
-    arm_curve = generate_curve(
-        arm_start,
+    # Armhole curve
+    curve = bezier_quadratic(
         (
-            shoulder_half - 1.5,
-            length - armhole + 2
+            quarter_chest + 0.5,
+            armhole_y
         ),
-        shoulder_end,
-        20
+        (
+            shoulder_half + 1.0,
+            armhole_y + 1.0
+        ),
+        (
+            shoulder_half,
+            length - 1.0
+        ),
+        18
     )
 
-    # Neckline
+    points.extend(curve)
 
-    neck_width = m["neck_width"]
+    # Shoulder / neckline
 
-    neck_drop = m["front_neck_drop"]
-
-    neck_curve = generate_curve(
+    points.append(
         (
-            0,
+            neck_width,
+            length
+        )
+    )
+
+    neck_curve = bezier_quadratic(
+        (
+            neck_width,
             length
         ),
         (
-            neck_width * 0.45,
-            length - neck_drop
+            neck_width * 0.6,
+            length - neck_depth * 0.35
         ),
         (
-            neck_width,
-            length - 0.5
+            0,
+            length - neck_depth
         ),
-        15
+        12
     )
 
-    points = [
-
-        p0,
-
-        p1,
-
-        p2,
-
-        p3,
-
-        (shoulder_half, length - 1.0),
-
-    ]
-
-    points += list(
-        reversed(arm_curve)
-    )
-
-    points += list(
-        reversed(neck_curve)
-    )
+    points.extend(neck_curve)
 
     return points
 
 
-# ============================================================
-# BACK BODICE
-# ============================================================
+def make_back(spec):
 
-def build_back(
-    m,
-    settings
-):
+    m = normalize_measurements(spec)
 
     chest = m["chest"]
-
     waist = m["waist"]
-
     length = m["length"]
-
     shoulder = m["shoulder"]
+    armhole = m["armhole"]
 
-    chest_q = chest / 4
-
-    waist_q = waist / 4
+    quarter_chest = chest / 4
+    quarter_waist = waist / 4
 
     shoulder_half = shoulder / 2
 
-    armhole = max(
-        7,
-        chest / 6 + 1
+    neck_width = max(
+        2.5,
+        shoulder * 0.28
     )
 
-    arm_start = (
-        chest_q,
-        length - armhole
-    )
+    neck_depth = 1.0
 
-    shoulder_end = (
-        shoulder_half,
-        length - 1
-    )
+    armhole_y = length - armhole
 
-    arm_curve = generate_curve(
-        arm_start,
+    points = [
+        (0, 0),
+        (quarter_waist + 2.0, 0),
         (
-            shoulder_half - 1,
-            length - armhole + 2
+            quarter_waist + 1.5,
+            length * 0.45
         ),
-        shoulder_end,
-        20
+        (
+            quarter_chest + 0.5,
+            armhole_y
+        )
+    ]
+
+    curve = bezier_quadratic(
+        (
+            quarter_chest + 0.5,
+            armhole_y
+        ),
+        (
+            shoulder_half + 1.0,
+            armhole_y + 1.0
+        ),
+        (
+            shoulder_half,
+            length - 1.0
+        ),
+        18
     )
 
-    neck_width = m["neck_width"]
+    points.extend(curve)
 
-    neck_drop = m["back_neck_drop"]
-
-    neck_curve = generate_curve(
+    points.append(
         (
-            0,
+            neck_width,
+            length
+        )
+    )
+
+    neck_curve = bezier_quadratic(
+        (
+            neck_width,
             length
         ),
         (
-            neck_width * 0.45,
-            length - neck_drop
-        ),
-        (
-            neck_width,
+            neck_width * 0.6,
             length - 0.5
         ),
-        15
+        (
+            0,
+            length - neck_depth
+        ),
+        10
     )
 
-    points = [
-
-        (0, 0),
-
-        (chest_q, 0),
-
-        (waist_q, length * 0.5),
-
-        (waist_q, length),
-
-        shoulder_end
-
-    ]
-
-    points += list(
-        reversed(arm_curve)
-    )
-
-    points += list(
-        reversed(neck_curve)
-    )
+    points.extend(neck_curve)
 
     return points
 
@@ -567,189 +630,325 @@ def build_back(
 # SLEEVE
 # ============================================================
 
-def build_sleeve(
-    m,
-    settings
-):
+def make_sleeve(spec):
 
-    sleeve_length = m["sleeve"]
+    m = normalize_measurements(spec)
 
+    sleeve_length = m["sleeve_length"]
+    armhole = m["armhole"]
     chest = m["chest"]
 
-    sleeve_opening = m[
-        "sleeve_opening"
-    ]
-
-    armhole = max(
-        7,
-        chest / 6 + 1
+    bicep = max(
+        10.0,
+        chest * 0.18
     )
 
-    sleeve_width = (
-        armhole * 0.85
-    )
-
-    cap_height = (
+    cap_height = max(
+        4.0,
         armhole * 0.65
     )
 
-    top_y = sleeve_length
-
-    left = (
-        0,
-        0
-    )
+    left = (0, 0)
+    right = (bicep * 2, 0)
 
     left_cap = (
         0,
-        top_y - cap_height
+        sleeve_length - cap_height
     )
 
-    center = (
-        sleeve_width,
-        top_y
+    top = (
+        bicep,
+        sleeve_length
     )
 
     right_cap = (
-        sleeve_width * 2,
-        top_y - cap_height
-    )
-
-    right = (
-        sleeve_width * 2,
-        0
-    )
-
-    left_curve = generate_curve(
-        left_cap,
-        (
-            sleeve_width * 0.30,
-            top_y + 0.5
-        ),
-        center,
-        20
-    )
-
-    right_curve = generate_curve(
-        center,
-        (
-            sleeve_width * 1.70,
-            top_y + 0.5
-        ),
-        right_cap,
-        20
-    )
-
-    cuff_width = max(
-        sleeve_opening,
-        3
+        bicep * 2,
+        sleeve_length - cap_height
     )
 
     points = [
-
         left,
-
         left_cap
-
     ]
 
-    points += left_curve
-
-    points += right_curve
-
-    points += [
-
-        right_cap,
-
-        right,
-
+    curve1 = bezier_quadratic(
+        left_cap,
         (
-            cuff_width * 2,
-            0
-        )
+            bicep * 0.25,
+            sleeve_length
+        ),
+        top,
+        18
+    )
 
-    ]
+    curve2 = bezier_quadratic(
+        top,
+        (
+            bicep * 1.75,
+            sleeve_length
+        ),
+        right_cap,
+        18
+    )
+
+    points.extend(curve1[1:])
+    points.extend(curve2[1:])
+
+    points.extend([
+        right_cap,
+        right
+    ])
 
     return points
 
 
 # ============================================================
-# NECK FACING
+# COLLAR
 # ============================================================
 
-def build_facing(
-    m,
-    settings
-):
+def make_collar(spec):
 
-    width = max(
-        m["neck_width"] * 2,
-        10
+    m = normalize_measurements(spec)
+
+    neck = max(
+        12.0,
+        m["shoulder"] * 1.8
     )
 
-    depth = 2.5
+    width = 3.0
 
     return [
-
         (0, 0),
-
-        (width, 0),
-
-        (width, depth),
-
-        (0, depth)
-
+        (neck, 0),
+        (neck - 1.0, width),
+        (1.0, width)
     ]
 
 
 # ============================================================
-# SEAM ALLOWANCE
+# COLLAR STAND
 # ============================================================
 
-def add_seam_allowance(
-    points,
-    allowance
-):
+def make_collar_stand(spec):
 
-    """
-    Basic outward allowance representation.
+    m = normalize_measurements(spec)
 
-    NOTE:
-    This is a drafting approximation.
-    For production-grade nested CAD,
-    use a proper geometric offset engine.
-    """
+    neck = max(
+        12.0,
+        m["shoulder"] * 1.8
+    )
+
+    height = 1.25
+
+    return [
+        (0, 0),
+        (neck, 0),
+        (neck - 0.5, height),
+        (0.5, height)
+    ]
+
+
+# ============================================================
+# CUFF
+# ============================================================
+
+def make_cuff(spec):
+
+    m = normalize_measurements(spec)
+
+    sleeve = m["sleeve_length"]
+
+    width = 5.0
+    length = max(
+        5.0,
+        sleeve * 0.25
+    )
+
+    return [
+        (0, 0),
+        (length, 0),
+        (length, width),
+        (0, width)
+    ]
+
+
+# ============================================================
+# PLACKET
+# ============================================================
+
+def make_placket(spec):
+
+    m = normalize_measurements(spec)
+
+    length = m["length"]
+
+    width = 2.5
+
+    return [
+        (0, 0),
+        (length * 0.55, 0),
+        (length * 0.55, width),
+        (0, width)
+    ]
+
+
+# ============================================================
+# NECKBAND
+# ============================================================
+
+def make_neckband(spec):
+
+    m = normalize_measurements(spec)
+
+    neck = max(
+        12.0,
+        m["shoulder"] * 1.8
+    )
+
+    width = 1.5
+
+    return [
+        (0, 0),
+        (neck, 0),
+        (neck, width),
+        (0, width)
+    ]
+
+
+# ============================================================
+# POCKET
+# ============================================================
+
+def make_pocket(spec):
+
+    width = 6.0
+    height = 7.0
+
+    return [
+        (0, 0),
+        (width, 0),
+        (width, height),
+        (0, height)
+    ]
+
+
+# ============================================================
+# BUILD PIECES
+# ============================================================
+
+def build_pieces(spec, plan):
+
+    pieces = {}
+
+    family = plan.get(
+        "family",
+        "basic"
+    )
+
+    requested = plan.get(
+        "pieces",
+        []
+    )
+
+    for piece in requested:
+
+        name = piece.upper()
+
+        if name in [
+            "FRONT",
+            "FRONT_BODICE"
+        ]:
+
+            pieces[name] = make_front(spec)
+
+        elif name in [
+            "BACK",
+            "BACK_BODICE"
+        ]:
+
+            pieces[name] = make_back(spec)
+
+        elif name == "SLEEVE":
+
+            pieces[name] = make_sleeve(spec)
+
+        elif name == "COLLAR":
+
+            pieces[name] = make_collar(spec)
+
+        elif name == "COLLAR_STAND":
+
+            pieces[name] = make_collar_stand(spec)
+
+        elif name == "CUFF":
+
+            pieces[name] = make_cuff(spec)
+
+        elif name == "PLACKET":
+
+            pieces[name] = make_placket(spec)
+
+        elif name == "NECKBAND":
+
+            pieces[name] = make_neckband(spec)
+
+        elif name == "POCKET":
+
+            pieces[name] = make_pocket(spec)
+
+        elif name == "FACING":
+
+            pieces["FACING"] = make_front(spec)
+
+    return pieces
+
+
+# ============================================================
+# ADD SEAM ALLOWANCE
+# ============================================================
+
+def offset_polygon(points, allowance=0.5):
+
+    # Simple radial approximation.
+    # Production-grade nested offset should later use
+    # shapely.buffer for complex curves.
+
+    if not points:
+        return points
+
+    cx = sum(
+        p[0] for p in points
+    ) / len(points)
+
+    cy = sum(
+        p[1] for p in points
+    ) / len(points)
 
     result = []
 
-    min_x, max_x, min_y, max_y = bounds(
-        points
-    )
-
     for x, y in points:
 
-        new_x = x
+        dx = x - cx
+        dy = y - cy
 
-        new_y = y
-
-        if abs(x - min_x) < 0.0001:
-            new_x -= allowance
-
-        if abs(x - max_x) < 0.0001:
-            new_x += allowance
-
-        if abs(y - min_y) < 0.0001:
-            new_y -= allowance
-
-        if abs(y - max_y) < 0.0001:
-            new_y += allowance
-
-        result.append(
-            (
-                new_x,
-                new_y
-            )
+        length = math.sqrt(
+            dx * dx + dy * dy
         )
+
+        if length == 0:
+
+            result.append(
+                (x, y)
+            )
+
+        else:
+
+            result.append(
+                (
+                    x + allowance * dx / length,
+                    y + allowance * dy / length
+                )
+            )
 
     return result
 
@@ -759,510 +958,181 @@ def add_seam_allowance(
 # ============================================================
 
 def add_grainline(
-    msp,
-    cx,
-    cy,
-    length=8
+    doc,
+    points,
+    x_offset,
+    layer="GRAINLINE"
 ):
 
-    msp.add_line(
+    ys = [
+        p[1]
+        for p in points
+    ]
 
-        (
-            cx,
-            cy - length / 2
-        ),
+    xs = [
+        p[0]
+        for p in points
+    ]
 
-        (
-            cx,
-            cy + length / 2
-        ),
+    if not ys:
+        return
 
-        dxfattribs={
-            "layer": "GRAINLINE"
-        }
+    min_y = min(ys)
+    max_y = max(ys)
 
+    center_x = (
+        min(xs) + max(xs)
+    ) / 2
+
+    p1 = (
+        center_x + x_offset,
+        min_y + 2
+    )
+
+    p2 = (
+        center_x + x_offset,
+        max_y - 2
+    )
+
+    add_line(
+        doc,
+        p1,
+        p2,
+        layer
     )
 
 
 # ============================================================
-# NOTCH
+# NOTCHES
 # ============================================================
 
 def add_notch(
-    msp,
-    x,
-    y,
-    size=0.25
+    doc,
+    point,
+    direction=(0, 1)
 ):
 
-    msp.add_line(
+    x, y = point
 
-        (
-            x - size,
-            y
-        ),
+    length = 0.3
 
-        (
-            x + size,
-            y
-        ),
+    dx, dy = direction
 
-        dxfattribs={
-            "layer": "NOTCH"
-        }
+    end = (
+        x + dx * length,
+        y + dy * length
+    )
 
+    add_line(
+        doc,
+        point,
+        end,
+        "NOTCHES"
     )
 
 
 # ============================================================
-# TEXT LABEL
+# DXF EXPORT
 # ============================================================
 
-def add_label(
-    msp,
-    x,
-    y,
-    text,
-    height=0.25
+def export_dxf(
+    pieces,
+    spec,
+    output_path
 ):
-
-    msp.add_text(
-        text,
-        dxfattribs={
-            "layer": "ANNOTATION",
-            "height": height
-        }
-    ).set_placement(
-        (
-            x,
-            y
-        )
-    )
-
-
-# ============================================================
-# DXF LAYERS
-# ============================================================
-
-def create_layers(doc):
-
-    layers = {
-
-        "PATTERN": 1,
-
-        "SEAM_ALLOWANCE": 2,
-
-        "GRAINLINE": 3,
-
-        "NOTCH": 4,
-
-        "ANNOTATION": 5,
-
-        "CENTER_LINE": 6,
-
-        "INTERNAL": 7
-
-    }
-
-    for name, color in layers.items():
-
-        if name not in doc.layers:
-
-            doc.layers.add(
-                name,
-                color=color
-            )
-
-
-# ============================================================
-# DRAW PIECE
-# ============================================================
-
-def draw_piece(
-    msp,
-    ax,
-    name,
-    points,
-    current_x,
-    settings,
-    add_allowance=True
-):
-
-    pts = offset_points(
-        points,
-        current_x,
-        0
-    )
-
-    # Main pattern
-
-    msp.add_lwpolyline(
-
-        pts,
-
-        close=True,
-
-        dxfattribs={
-            "layer": "PATTERN"
-        }
-
-    )
-
-    # Seam allowance
-
-    if add_allowance:
-
-        sa_points = add_seam_allowance(
-            points,
-            settings.seam_allowance
-        )
-
-        sa_points = offset_points(
-            sa_points,
-            current_x,
-            0
-        )
-
-        msp.add_lwpolyline(
-
-            sa_points,
-
-            close=True,
-
-            dxfattribs={
-                "layer": "SEAM_ALLOWANCE"
-            }
-
-        )
-
-    # Technical preview
-
-    arr = np.array(
-        pts,
-        dtype=float
-    )
-
-    ax.plot(
-
-        arr[:, 0],
-        arr[:, 1],
-
-        linewidth=1.5,
-
-        label=name
-
-    )
-
-    # Center
-
-    cx = float(
-        np.mean(arr[:, 0])
-    )
-
-    cy = float(
-        np.mean(arr[:, 1])
-    )
-
-    # Piece label
-
-    ax.text(
-
-        cx,
-        cy,
-
-        name,
-
-        fontsize=8,
-
-        weight="bold",
-
-        ha="center",
-
-        va="center"
-
-    )
-
-    # Grainline
-
-    add_grainline(
-        msp,
-        cx,
-        cy
-    )
-
-    ax.annotate(
-
-        "",
-
-        xy=(
-            cx,
-            cy + 4
-        ),
-
-        xytext=(
-            cx,
-            cy - 4
-        ),
-
-        arrowprops={
-            "arrowstyle": "<->",
-            "linewidth": 1
-        }
-
-    )
-
-    ax.text(
-        cx + 0.3,
-        cy,
-        "GRAINLINE",
-        rotation=90,
-        fontsize=5,
-        va="center"
-    )
-
-    # Center line
-
-    min_x, max_x, min_y, max_y = bounds(
-        pts
-    )
-
-    msp.add_line(
-
-        (
-            cx,
-            min_y
-        ),
-
-        (
-            cx,
-            max_y
-        ),
-
-        dxfattribs={
-            "layer": "CENTER_LINE"
-        }
-
-    )
-
-    return max_x - min_x
-
-
-# ============================================================
-# MAIN GENERATOR
-# ============================================================
-
-def generate_technical_draft_and_dxf(
-
-    spec_data,
-
-    out_dxf="drafted_pattern.dxf",
-
-    out_png="blueprint.png"
-
-):
-
-    # --------------------------------------------------------
-    # Normalize data
-    # --------------------------------------------------------
-
-    m = normalize_measurements(
-        spec_data
-    )
-
-    garment_type = str(
-        spec_data.get(
-            "garment_type",
-            "Garment"
-        )
-    )
-
-    size = spec_data.get(
-        "size",
-        "S"
-    )
-
-    settings = PatternSettings(
-        seam_allowance=0.5,
-        hem_allowance=1.0
-    )
-
-    # --------------------------------------------------------
-    # Build pattern pieces
-    # --------------------------------------------------------
-
-    pieces = {
-
-        "FRONT": build_front(
-            m,
-            settings
-        ),
-
-        "BACK": build_back(
-            m,
-            settings
-        ),
-
-        "SLEEVE": build_sleeve(
-            m,
-            settings
-        ),
-
-        "NECK_FACING": build_facing(
-            m,
-            settings
-        )
-
-    }
-
-    # --------------------------------------------------------
-    # Create DXF
-    # --------------------------------------------------------
 
     doc = ezdxf.new(
-        "R2010"
+        "R2018"
     )
 
-    create_layers(
-        doc
-    )
+    # Layers
 
-    msp = doc.modelspace()
+    for layer in [
+        "PATTERN",
+        "SEAM_ALLOWANCE",
+        "GRAINLINE",
+        "NOTCHES",
+        "INTERNAL",
+        "LABELS"
+    ]:
 
-    # --------------------------------------------------------
-    # Preview
-    # --------------------------------------------------------
+        if layer not in doc.layers:
 
-    fig, ax = plt.subplots(
-        figsize=(18, 10)
-    )
+            doc.layers.add(
+                layer
+            )
 
-    current_x = 0
+    current_x = 0.0
+    spacing = 8.0
 
-    spacing = 8
-
-    # --------------------------------------------------------
-    # Draw pieces
-    # --------------------------------------------------------
+    piece_positions = {}
 
     for name, points in pieces.items():
 
-        width = draw_piece(
+        if not points:
+            continue
 
-            msp,
+        xs = [
+            p[0]
+            for p in points
+        ]
 
-            ax,
+        width = (
+            max(xs) - min(xs)
+        )
 
-            name,
+        shifted = [
+            (
+                p[0] + current_x,
+                p[1]
+            )
+            for p in points
+        ]
 
-            points,
-
+        piece_positions[name] = (
             current_x,
-
-            settings
-
+            shifted
         )
 
-        current_x += (
-            width + spacing
+        add_polygon(
+            doc,
+            name,
+            shifted,
+            "PATTERN"
         )
 
-    # --------------------------------------------------------
-    # Add technical information
-    # --------------------------------------------------------
+        # Seam allowance
 
-    info_x = current_x
-
-    info_y = m["length"] * 0.8
-
-    info_lines = [
-
-        "GARMENT AI PATTERN",
-
-        "────────────────────────",
-
-        f"Garment: {garment_type}",
-
-        f"Size: {size}",
-
-        "",
-
-        "MEASUREMENTS",
-
-        f"Chest: {m['chest']:.2f}\"",
-
-        f"Waist: {m['waist']:.2f}\"",
-
-        f"Hip: {m['hip']:.2f}\"",
-
-        f"Length: {m['length']:.2f}\"",
-
-        f"Shoulder: {m['shoulder']:.2f}\"",
-
-        f"Sleeve: {m['sleeve']:.2f}\"",
-
-        "",
-
-        "CONSTRUCTION",
-
-        "Seam Allowance: 0.50\"",
-
-        "Hem Allowance: 1.00\"",
-
-        "Grainline: Marked",
-
-        "Notches: Marked",
-
-        "",
-
-        "OUTPUT",
-
-        "DXF R2010",
-
-        "Units: Inch"
-
-    ]
-
-    for i, line in enumerate(
-        info_lines
-    ):
-
-        ax.text(
-
-            info_x,
-
-            info_y - (
-                i * 1.0
-            ),
-
-            line,
-
-            fontsize=8,
-
-            family="monospace"
-
+        allowance = offset_polygon(
+            points,
+            0.5
         )
 
-    # --------------------------------------------------------
-    # Preview settings
-    # --------------------------------------------------------
+        allowance = [
+            (
+                p[0] + current_x,
+                p[1]
+            )
+            for p in allowance
+        ]
 
-    ax.set_aspect(
-        "equal",
-        adjustable="datalim"
-    )
+        add_polygon(
+            doc,
+            name,
+            allowance,
+            "SEAM_ALLOWANCE"
+        )
 
-    ax.axis(
-        "off"
-    )
+        # Grainline
 
-    ax.set_title(
-        "GARMENT AI — TECHNICAL PATTERN DRAFT",
-        fontsize=15,
-        weight="bold"
-    )
+        add_grainline(
+            doc,
+            points,
+            current_x
+        )
 
-    plt.tight_layout()
+        # Label
 
-    # --------------------------------------------------------
-    # Save files
-    # ------------------------------
+        cx = (
+            min(
+                p[0]
