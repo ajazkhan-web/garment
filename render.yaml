@@ -6,9 +6,11 @@ services:
     buildCommand: pip install --no-cache-dir -r requirements.txt && pip install --no-cache-dir matplotlib Pillow || echo "matplotlib/Pillow install failed — bot will run without blueprint preview"
     startCommand: python telegram_bot.py
     envVars:
-      - key: OPENROUTER_API_KEY
-        sync: false
       - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: GOOGLE_API_KEY
+        sync: false
+      - key: OPENROUTER_API_KEY
         sync: false
       - key: BOT_MODE
         value: polling
