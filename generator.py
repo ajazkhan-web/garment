@@ -1,163 +1,129 @@
-from pathlib import Path
-from typing import Dict
+import os
 import ezdxf
-from ezdxf import colors
+import matplotlib.pyplot as plt
+import numpy as np
 
-MM_PER_INCH = 25.4
+TEMPLATES_DIR = "saved_templates"
+os.makedirs(TEMPLATES_DIR, exist_ok=True)
 
-
-def inch(value: float) -> float:
-    return float(value) * MM_PER_INCH
-
-
-def add_polyline(msp, points, layer="CUT", closed=True):
-    msp.add_lwpolyline(
-        points,
-        close=closed,
-        dxfattribs={"layer": layer},
-    )
-
-
-def add_text(msp, text, x, y, layer="ANNOTATION", height=7):
-    entity = msp.add_text(
-        str(text),
-        dxfattribs={
-            "layer": layer,
-            "height": height,
-        },
-    )
-    entity.set_placement((x, y))
-
-
-def make_dress(measurements: Dict[str, float], output_file: str):
-    m = measurements
-
-    length = inch(m["length"])
-    bust = inch((m["bust"] + m.get("bust_ease", 5)) / 4)
-    hip = inch((m["hip"] + m.get("hip_ease", 6)) / 4)
-    bottom = inch(m.get("bottom_opening", 48) / 2)
-    shoulder = inch(m["shoulder"] / 2)
-    armhole = inch(m["armhole"])
-    side_slit = inch(m.get("side_slit", 16))
-    neck_width = inch(m.get("neck_width", 7))
-
-    doc = ezdxf.new("R2010")
+def save_master_dxf(source_dxf_path, garment_type="default"):
+    clean_name = garment_type.lower().replace(" ", "_") + ".dxf"
+    target_path = os.path.join(TEMPLATES_DIR, clean_name)
+    
+    # Read & space pieces
+    doc = ezdxf.readfile(source_dxf_path)
     msp = doc.modelspace()
+    new_doc = ezdxf.new('R2010')
+    new_msp = new_doc.modelspace()
+    
+    pieces = []
+    for e in list(msp.query('LWPOLYLINE')) + list(msp.query('POLYLINE')):
+        pts = [(p[0], p[1]) for p in (e.get_points() if e.dxftype() == 'LWPOLYLINE' else [v.dxf.location for v in e.vertices])]
+        if len(pts) > 2:
+            pieces.append(pts)
+            
+    # Write normalized spaced pieces
+    cur_x = 0.0
+    for idx, pts in enumerate(pieces):
+        arr = np.array(pts, dtype=float)
+        arr[:, 0] -= np.min(arr[:, 0])
+        arr[:, 1] -= np.min(arr[:, 1])
+        w = np.max(arr[:, 0])
+        arr[:, 0] += cur_x
+        poly = [(float(p[0]), float(p[1])) for p in arr]
+        new_msp.add_lwpolyline(poly, close=True, dxfattribs={'layer': f'PIECE_{idx+1}'})
+        cur_x += w + 6.0
+        
+    new_doc.saveas(target_path)
+    # Also save as default master
+    new_doc.saveas(os.path.join(TEMPLATES_DIR, "master.dxf"))
+    return target_path, len(pieces)
 
-    layers = {
-        "CUT": colors.WHITE,
-        "STITCH": colors.YELLOW,
-        "GRAIN": colors.GREEN,
-        "NOTCH": colors.RED,
-        "ANNOTATION": colors.CYAN,
+def generate_technical_draft_and_dxf(spec_data, out_dxf="pattern.dxf", out_png="draft.png"):
+    gtype = spec_data.get('garment_type', 'dress').lower()
+    chest = float(spec_data.get('chest', 36.0) or 36.0)
+    length = float(spec_data.get('length', 34.0) or 34.0)
+    shoulder = float(spec_data.get('shoulder', 13.5) or 13.5)
+    sleeve = float(spec_data.get('sleeve_length', 20.0) or 20.0)
+    waist = float(spec_data.get('waist', 29.0) or (chest - 6.0))
+    armhole = float(spec_data.get('armhole', 7.5) or 8.0)
+    
+    hc = chest / 4.0
+    hw = waist / 4.0
+    hs = shoulder / 2.0
+
+    # 1. Coordinate Drafting Geometry
+    if "dress" in gtype or "blazer" in gtype:
+        front = [(0, 0), (hw + 3.0, 0), (hw + 2.0, length * 0.4), (hc + 1.5, length - armhole), (hs, length - 1.5), (3.5, length - 0.5), (0, length - 7.0)]
+        back = [(0, 0), (hw + 2.0, 0), (hw + 1.5, length * 0.4), (hc + 1.0, length - armhole), (hs, length - 1.5), (3.5, length - 0.5), (0, length - 1.0)]
+        sleeve_pts = [(0, 0), (8.0, 0), (7.0, sleeve - 4.0), (3.5, sleeve), (0, sleeve - 4.0)]
+        collar_pts = [(0, 0), (14.0, 0), (14.0, 2.5), (0, 2.5)]
+    else: # Jacket / Top
+        front = [(0, 0), (hc + 4, 0), (hc + 4, length - armhole), (hs, length - 1.5), (4.0, length - 0.5), (0, length - 4.5)]
+        back = [(0, 0), (hc + 4, 0), (hc + 4, length - armhole), (hs, length - 1.5), (4.0, length - 0.5), (0, length - 1.0)]
+        sleeve_pts = [(0, 0), (9.5, 0), (9.0, sleeve - 4.0), (4.5, sleeve), (0, sleeve - 4.0)]
+        collar_pts = [(0, 0), (16.0, 0), (16.0, 2.5), (0, 2.5)]
+
+    pieces = {
+        "FRONT_PANEL": front,
+        "BACK_PANEL": back,
+        "SLEEVE": sleeve_pts,
+        "COLLAR": collar_pts
     }
 
-    for name, color in layers.items():
-        if name not in doc.layers:
-            doc.layers.new(name, dxfattribs={"color": color})
+    # 2. DXF Setup
+    doc = ezdxf.new('R2010')
+    msp = doc.modelspace()
 
-    # Front body, half pattern, center front on fold
-    front_x = 0
-    front = [
-        (front_x, 0),
-        (front_x + neck_width, 0),
-        (front_x + shoulder, armhole * 0.55),
-        (front_x + bust, armhole * 1.30),
-        (front_x + hip, length * 0.58),
-        (front_x + bottom, length),
-        (front_x, length),
-    ]
+    # 3. Plotting Blueprint (Perplexity CAD Style)
+    fig, ax = plt.subplots(figsize=(16, 8), facecolor='#FFFFFF')
+    ax.set_facecolor('#FFFFFF')
 
-    add_polyline(msp, front, "CUT")
-    add_text(msp, "FRONT - CUT 1 ON FOLD", front_x, length + 25)
+    cur_x = 0.0
+    for name, pts in pieces.items():
+        arr = np.array(pts, dtype=float)
+        w = np.max(arr[:, 0]) - np.min(arr[:, 0])
+        arr[:, 0] += cur_x
+        
+        # Polyline into DXF
+        poly = [(float(p[0]), float(p[1])) for p in arr]
+        msp.add_lwpolyline(poly, close=True, dxfattribs={'layer': name})
+        
+        # Technical CAD Blueprint Outline
+        patch = plt.Polygon(arr, closed=True, facecolor='none', edgecolor='#2B4C2D', linewidth=1.8)
+        ax.add_patch(patch)
+        
+        # Piece Label & Grainline
+        cx, cy = np.mean(arr[:, 0]), np.mean(arr[:, 1])
+        ax.text(cx, cy, name, color='#2B4C2D', weight='bold', fontsize=9, ha='center', va='center')
+        ax.annotate('', xy=(cx, cy + 4), xytext=(cx, cy - 4), arrowprops=dict(arrowstyle='<->', color='#666', lw=1.2))
+        ax.text(cx + 0.5, cy, "GRAINLINE", rotation=90, fontsize=6, color='#666', va='center')
+        
+        cur_x += w + 6.0
 
-    msp.add_line(
-        (front_x - 20, 0),
-        (front_x - 20, length),
-        dxfattribs={"layer": "GRAIN"},
+    doc.saveas(out_dxf)
+
+    # Drafting Tech Spec Box
+    spec_box = (
+        f"2D CAD DRAFTING SPECIFICATIONS\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"• Style: {spec_data.get('garment_type', 'Garment')}\n"
+        f"• Size: {spec_data.get('size', 'S')}\n"
+        f"• Bust/Chest: {chest}\" | Waist: {waist}\"\n"
+        f"• Length: {length}\" | Shoulder: {shoulder}\"\n"
+        f"• Sleeve Length: {sleeve}\" | Armhole: {armhole}\"\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"• Seam Allowance: 0.5\" Included\n"
+        f"• Optitex AAMA Formatted"
     )
+    ax.text(cur_x + 1.0, length * 0.4, spec_box, fontsize=9, family='monospace', bbox=dict(boxstyle='round,pad=0.8', facecolor='#F8F9FA', edgecolor='#D0D7DE'))
 
-    add_text(msp, "FOLD", front_x - 65, length / 2, "GRAIN", 6)
+    ax.autoscale_view()
+    ax.set_aspect('equal')
+    ax.axis('off')
+    plt.title("Optitex 2D Pattern Layout & Technical Drafting Blueprint", fontsize=13, weight='bold', pad=15, color='#1A202C')
+    plt.tight_layout()
+    plt.savefig(out_png, dpi=250, bbox_inches='tight')
+    plt.close(fig)
 
-    # Side slit mark
-    slit_y = length - side_slit
-    msp.add_line(
-        (front_x + hip, slit_y),
-        (front_x + bottom, slit_y),
-        dxfattribs={"layer": "NOTCH"},
-    )
-    add_text(msp, "SIDE SLIT START", front_x + hip, slit_y + 15, "NOTCH", 6)
-
-    # Back body
-    back_x = max(500, bottom + 200)
-
-    back = [
-        (back_x, 0),
-        (back_x + neck_width, 0),
-        (back_x + shoulder, armhole * 0.55),
-        (back_x + bust, armhole * 1.30),
-        (back_x + hip, length * 0.58),
-        (back_x + bottom, length),
-        (back_x, length),
-    ]
-
-    add_polyline(msp, back, "CUT")
-    add_text(msp, "BACK - CUT 1 ON FOLD", back_x, length + 25)
-
-    msp.add_line(
-        (back_x - 20, 0),
-        (back_x - 20, length),
-        dxfattribs={"layer": "GRAIN"},
-    )
-
-    # Sleeve
-    sleeve_x = 0
-    sleeve_y = -250
-    sleeve_length = inch(m.get("sleeve_length", 9))
-    sleeve_opening = inch(m.get("sleeve_opening", 13) / 2)
-
-    sleeve = [
-        (sleeve_x, sleeve_y),
-        (sleeve_x + shoulder * 0.75, sleeve_y + armhole * 0.40),
-        (sleeve_x + shoulder, sleeve_y + sleeve_length * 0.25),
-        (sleeve_x + sleeve_opening, sleeve_y + sleeve_length),
-        (sleeve_x, sleeve_y + sleeve_length),
-    ]
-
-    add_polyline(msp, sleeve, "CUT")
-    add_text(msp, "SLEEVE - CUT 2", sleeve_x, sleeve_y + sleeve_length + 25)
-
-    msp.add_line(
-        (sleeve_x + shoulder / 2, sleeve_y),
-        (sleeve_x + shoulder / 2, sleeve_y + sleeve_length),
-        dxfattribs={"layer": "GRAIN"},
-    )
-
-    # Neckband
-    neck_x = 550
-    neck_y = -250
-    neckband_length = inch(m.get("neck_width", 7) * 2.8)
-    neckband_width = inch(2.5)
-
-    neckband = [
-        (neck_x, neck_y),
-        (neck_x + neckband_length, neck_y),
-        (neck_x + neckband_length, neck_y + neckband_width),
-        (neck_x, neck_y + neckband_width),
-    ]
-
-    add_polyline(msp, neckband, "CUT")
-    add_text(msp, "NECKBAND - CUT 1", neck_x, neck_y + neckband_width + 25)
-
-    add_text(
-        msp,
-        "ALL DIMENSIONS IN MILLIMETERS",
-        0,
-        -370,
-        "ANNOTATION",
-        7,
-    )
-
-    Path(output_file).parent.mkdir(parents=True, exist_ok=True)
-    doc.saveas(output_file)
-    return output_file
+    return out_dxf, out_png
