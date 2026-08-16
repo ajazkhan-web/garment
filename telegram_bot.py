@@ -402,13 +402,93 @@ class SessionState:
 
 
 user_sessions: dict[int, SessionState] = {}
-# ─── AI Client: Gemini (free) if key set, else OpenRouter (paid) ───
-if config.USE_GEMINI:
-    ai_client = GeminiClient()
-    logger.info("Using Google Gemini (free tier) for multimodal extraction.")
-else:
-    ai_client = OpenRouterClient()
-    logger.info("Using OpenRouter (Claude Sonnet 4) for multimodal extraction.")
+# ─── Unified AI Client: Gemini (primary) → OpenRouter (fallback) ───
+
+class UnifiedAIClient:
+    """Tries Google Gemini first (free tier). If Gemini fails at runtime
+    (network error, 403, 429, etc.) AND OpenRouter is configured, falls
+    back to OpenRouter. Never silently defaults to OpenRouter — Gemini
+    is always attempted first."""
+
+    def __init__(self):
+        self._gemini = None
+        self._openrouter = None
+        self._gemini_available = bool(config.GOOGLE_API_KEY)
+        self._openrouter_available = bool(getattr(config, "OPENROUTER_API_KEY", ""))
+
+        if self._gemini_available:
+            self._gemini = GeminiClient()
+            logger.info("🟢 Primary AI: Google Gemini (free tier) — GOOGLE_API_KEY detected")
+        else:
+            logger.warning("⚠️  GOOGLE_API_KEY not set in environment — Gemini unavailable. "
+                           "Set GOOGLE_API_KEY to enable free-tier parsing.")
+
+        if self._openrouter_available:
+            self._openrouter = OpenRouterClient()
+            logger.info("🔵 Fallback AI: OpenRouter (Claude Sonnet 4) — available as backup")
+        else:
+            logger.info("🔵 OpenRouter not configured — no fallback available")
+
+        if not self._gemini_available and not self._openrouter_available:
+            logger.error("❌ CRITICAL: No AI provider configured! "
+                         "Set GOOGLE_API_KEY (free) or OPENROUTER_API_KEY (paid).")
+
+    @property
+    def provider_name(self) -> str:
+        if self._gemini_available:
+            return "Google Gemini"
+        elif self._openrouter_available:
+            return "OpenRouter (fallback)"
+        return "NONE"
+
+    async def parse_measurement_sheet(self, image_bytes, mime_type="image/jpeg", user_hint=""):
+        # Try Gemini first
+        if self._gemini_available:
+            try:
+                logger.info("🔄 Attempting image parse with Google Gemini...")
+                result = await self._gemini.parse_measurement_sheet(image_bytes, mime_type, user_hint)
+                logger.info("✅ Gemini parse succeeded")
+                return result
+            except Exception as gemini_err:
+                logger.error(f"❌ Gemini parse failed: {gemini_err}")
+                if not self._openrouter_available:
+                    raise  # No fallback — re-raise the Gemini error
+                logger.warning("⚠️  Falling back to OpenRouter for image parsing...")
+
+        # Fallback to OpenRouter
+        if self._openrouter_available:
+            logger.info("🔄 Attempting image parse with OpenRouter (fallback)...")
+            return await self._openrouter.parse_measurement_sheet(image_bytes, mime_type, user_hint)
+
+        raise RuntimeError(
+            "No AI provider available. Set GOOGLE_API_KEY (free, recommended) "
+            "or OPENROUTER_API_KEY (paid fallback) in your environment."
+        )
+
+    async def parse_text_measurements(self, text):
+        if self._gemini_available:
+            try:
+                logger.info("🔄 Attempting text parse with Google Gemini...")
+                result = await self._gemini.parse_text_measurements(text)
+                logger.info("✅ Gemini text parse succeeded")
+                return result
+            except Exception as gemini_err:
+                logger.error(f"❌ Gemini text parse failed: {gemini_err}")
+                if not self._openrouter_available:
+                    raise
+                logger.warning("⚠️  Falling back to OpenRouter for text parsing...")
+
+        if self._openrouter_available:
+            logger.info("🔄 Attempting text parse with OpenRouter (fallback)...")
+            return await self._openrouter.parse_text_measurements(text)
+
+        raise RuntimeError(
+            "No AI provider available. Set GOOGLE_API_KEY (free, recommended) "
+            "or OPENROUTER_API_KEY (paid fallback) in your environment."
+        )
+
+ai_client = UnifiedAIClient()
+logger.info(f"AI Provider: {ai_client.provider_name}")
 template_db = TemplateDB()
 
 
