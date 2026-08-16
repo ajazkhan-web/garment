@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 from telegram import Update
 from telegram.request import HTTPXRequest
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
-from generator import save_master_dxf, generate_technical_draft_and_dxf
+from generator import generate_technical_draft_and_dxf
 
 load_dotenv()
 
@@ -29,33 +29,10 @@ def run_health_server():
     HTTPServer(('0.0.0.0', port), HealthCheckHandler).serve_forever()
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = (
-        "👗 *Garment AI Pattern & Drafting Engine Active!*\n\n"
-        "1️⃣ *Save Master Template:* CAD export `.dxf` file bhejiye — bot permanently save karega.\n"
-        "2️⃣ *Auto 2D CAD Drafting:* Kisi bhi new style ki Measurement Sheet bhejye — AI automatically 2D blueprint drafting image + Optitex-ready multi-piece DXF bana kar dega."
-    )
-    await update.message.reply_text(msg, parse_mode="Markdown")
+    await update.message.reply_text("👗 *Garment CAD Pattern Generator Active!*\nSpec sheet bhejiye, bot curved sleeve crown, armhole aur notches ke sath exact pattern bana kar dega.", parse_mode="Markdown")
 
-# 1. DXF Upload Handler
-async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    doc = update.message.document
-    if doc.file_name.lower().endswith(".dxf"):
-        status = await update.message.reply_text("📂 Processing & Saving Master Template DXF...")
-        f = await doc.get_file()
-        t_dxf = "temp_uploaded.dxf"
-        await f.download_to_drive(t_dxf)
-        
-        g_name = doc.file_name.replace(".dxf", "")
-        path, count = save_master_dxf(t_dxf, g_name)
-        
-        await status.delete()
-        await update.message.reply_text(f"✅ *Master Pattern Saved!* (`{count}` pieces recognized)\nAb jab bhi is type ki sheet aayegi, bot automatically execute karega.", parse_mode="Markdown")
-    else:
-        await update.message.reply_text("⚠️ Kripya `.dxf` pattern file bhejiye.")
-
-# 2. Spec Sheet Photo Handler
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    status = await update.message.reply_text("📐 Sheet analyze ho rahi hai... Drafting AI pattern...")
+    status = await update.message.reply_text("📐 Sheet analyze ho rahi hai... Drafting AI curves & notches...")
     photo = await update.message.photo[-1].get_file()
     img_path = "temp_spec.jpg"
     await photo.download_to_drive(img_path)
@@ -64,21 +41,23 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         b64 = base64.b64encode(f.read()).decode('utf-8')
 
     prompt = """
-    Analyze this garment spec sheet image. Extract measurement values into strictly valid JSON:
+    Read this measurement sheet and reference model image.
+    Extract key measurements into strictly valid JSON:
     {
-      "garment_type": "blazer dress / jacket / top",
+      "garment_type": "wrap blazer dress / jacket / top",
       "size": "S",
       "chest": 36.0,
       "waist": 29.0,
       "length": 34.0,
       "shoulder": 13.5,
       "sleeve_length": 20.0,
-      "armhole": 7.5
+      "armhole": 7.5,
+      "pleats": 4
     }
     Output ONLY JSON.
     """
 
-    spec = {"garment_type": "blazer dress", "size": "S", "chest": 36.0, "waist": 29.0, "length": 34.0, "shoulder": 13.5, "sleeve_length": 20.0, "armhole": 7.5}
+    spec = {"garment_type": "blazer dress", "size": "S", "chest": 36.0, "waist": 29.0, "length": 34.0, "shoulder": 13.5, "sleeve_length": 20.0, "armhole": 7.5, "pleats": 4}
     try:
         res = requests.post(
             "https://openrouter.ai/api/v1/chat/completions",
@@ -99,25 +78,26 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     dxf_out, png_out = generate_technical_draft_and_dxf(spec, "drafted_pattern.dxf", "blueprint.png")
 
     caption = (
-        f"🎉 *Optitex 2D Pattern Draft Ready!*\n\n"
+        f"🎉 *Optitex Pattern Draft Ready!*\n\n"
         f"• Garment: `{spec.get('garment_type', 'Garment')}`\n"
         f"• Size: `{spec.get('size', 'S')}`\n"
-        f"• Length: `{spec.get('length')}\"` | Chest/Bust: `{spec.get('chest')}\"`\n"
-        f"• Waist: `{spec.get('waist')}\"` | Shoulder: `{spec.get('shoulder')}\"`"
+        f"• Length: `{spec.get('length')}\"` | Bust: `{spec.get('chest')}\"`\n"
+        f"• Waist: `{spec.get('waist')}\"` | Shoulder: `{spec.get('shoulder')}\"`\n"
+        f"• Sleeve Cap & Armhole: Smooth Bezier CAD Curves\n"
+        f"• Details: Pleat & Notch Indicators Included"
     )
 
     await status.delete()
     with open(png_out, "rb") as pf:
         await update.message.reply_photo(photo=pf, caption=caption, parse_mode="Markdown")
     with open(dxf_out, "rb") as df:
-        await update.message.reply_document(document=df, filename=f"{spec.get('size','S')}_{spec.get('garment_type','pattern')}.dxf")
+        await update.message.reply_document(document=df, filename=f"{spec.get('size','S')}_{spec.get('garment_type','garment').replace(' ', '_')}.dxf")
 
 def main():
     if not TELEGRAM_BOT_TOKEN: return
     threading.Thread(target=run_health_server, daemon=True).start()
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).request(HTTPXRequest(connect_timeout=45.0, read_timeout=45.0)).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.run_polling(drop_pending_updates=True)
 
