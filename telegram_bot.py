@@ -272,7 +272,40 @@ class UserSession:
         valid_keys = set(measurements_obj_class.__dataclass_fields__.keys())
         filtered = {k: v for k, v in m_dict.items() if k in valid_keys and isinstance(v, (int, float))}
         self.measurement_dict = filtered
+        self._estimate_missing(filtered)
         self.measurements = measurements_obj_class(**filtered)
+
+    def _estimate_missing(self, m: dict):
+        """Estimate missing critical measurements from available ones."""
+        bust = m.get("bust", 0)
+        waist = m.get("waist", 0)
+        hip = m.get("hip", 0)
+        back_length = m.get("back_length", 0)
+        front_length = m.get("front_length", 0)
+        sleeve = m.get("sleeve_length", 0)
+        bicep = m.get("bicep", 0)
+        armhole = m.get("armhole_depth", 0)
+        shoulder = m.get("shoulder_width", 0)
+
+        # Hip estimation: typically bust - 2 to bust + 4
+        if hip <= 0 and bust > 0:
+            m["hip"] = round(bust + 2, 1)
+        # Back length estimation from front length
+        if back_length <= 0 and front_length > 0:
+            m["back_length"] = round(front_length * 0.95, 1)
+        # Back length from bust (standard approximation)
+        if back_length <= 0 and bust > 0 and front_length <= 0:
+            m["back_length"] = round(bust * 0.4 + 4, 1)
+            m["front_length"] = round(bust * 0.42 + 4, 1)
+        # Armhole depth from bust
+        if armhole <= 0 and bust > 0:
+            m["armhole_depth"] = round(bust * 0.1 + 2, 1)
+        # Bicep from sleeve length or bust
+        if bicep <= 0 and bust > 0:
+            m["bicep"] = round(bust * 0.15 + 5, 1)
+        # Shoulder width from bust
+        if shoulder <= 0 and bust > 0:
+            m["shoulder_width"] = round(bust * 0.38, 1)
         self.garment_type = result.get("garment_type", "dress")
         self.style_dict = result.get("styling_details", {}) or {}
         self.style = style_obj_class(
