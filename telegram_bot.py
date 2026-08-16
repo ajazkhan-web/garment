@@ -156,11 +156,16 @@ class OpenRouterClient:
         payload = {
             "model": self.model,
             "messages": messages,
-            "max_tokens": 2500,
+            "max_tokens": 2000,
             "temperature": 0.05,
         }
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             resp = await client.post(self.base_url, json=payload, headers=self._headers())
+            if resp.status_code == 402:
+                logger.error(f"OpenRouter credits exhausted (402): {resp.text[:300]}")
+                raise RuntimeError(
+                    "OpenRouter credits exhausted. Add credits at https://openrouter.ai/settings/credits to resume image parsing."
+                )
             if resp.status_code >= 400:
                 logger.error(f"OpenRouter HTTP {resp.status_code}: {resp.text[:500]}")
             resp.raise_for_status()
