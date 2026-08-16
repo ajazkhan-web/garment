@@ -5,14 +5,43 @@ No OpenRouter — no fallback. Gemini is the only engine.
 """
 import os
 
+
+def _normalize_google_key(key: str) -> str:
+    """Google AI Studio's newer key format is 'AQ.<rest>'. Secret-scanning
+    tools sometimes split off the 'AQ.' prefix as plain text and store only
+    the '<rest>' part as the secret. Restore the prefix so the key validates.
+    Legacy keys (starting with 'AIza') are left untouched."""
+    if not key:
+        return key
+    if key.startswith("AIza") or key.startswith("AQ."):
+        return key
+    return "AQ." + key
+
+
 # ─── Telegram ───
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 
 # ─── AI Provider (Google Gemini ONLY) ───
-# Try GOOGLE_API_KEY_2 first (latest key), fall back to GOOGLE_API_KEY
-GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY_2", "") or os.environ.get("GOOGLE_API_KEY", "")
-GEMINI_MODEL = "gemini-2.5-flash"          # fast, free tier, multimodal
-GEMINI_VISION_MODEL = "gemini-2.5-flash"   # same model handles text+image
+# Preference order: newest working key first, falling back down the chain.
+_KEY_CANDIDATES = [
+    os.environ.get("GOOGLE_API_KEY_3", ""),
+    os.environ.get("GOOGLE_API_KEY_2_2", ""),
+    os.environ.get("GOOGLE_API_KEY_2", ""),
+    os.environ.get("GOOGLE_API_KEY", ""),
+]
+GOOGLE_API_KEY = ""
+for _k in _KEY_CANDIDATES:
+    if _k:
+        GOOGLE_API_KEY = _normalize_google_key(_k)
+        break
+
+# gemini-2.5-flash / gemini-2.5-flash-lite are retired for new API keys.
+# gemini-flash-latest is the current model — it's a reasoning model, so we
+# disable "thinking" (thinkingBudget=0) at call time to avoid wasting the
+# token budget on invisible reasoning tokens.
+GEMINI_MODEL = "gemini-flash-latest"
+GEMINI_VISION_MODEL = "gemini-flash-latest"
+GEMINI_THINKING_BUDGET = 0   # disable extended thinking — direct answers only
 
 # Strict enforcement: Gemini is the sole AI provider. No fallback.
 DEFAULT_AI_PROVIDER = "gemini"
