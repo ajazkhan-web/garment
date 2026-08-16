@@ -1,254 +1,125 @@
-import asyncio
-import json
 import os
-import sqlite3
-from datetime import datetime
-from pathlib import Path
+import json
+import base64
+import re
+import requests
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from dotenv import load_dotenv
+from telegram import Update
+from telegram.request import HTTPXRequest
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
+from generator import save_master_dxf, generate_technical_draft_and_dxf
 
-from aiogram import Bot, Dispatcher, F
-from aiogram.filters import Command, CommandStart
-from aiogram.types import FSInputFile, Message
+load_dotenv()
 
-from generator import make_dress
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-type', 'text/plain')
+        self.end_headers()
+        self.wfile.write(b"Pattern AI Engine Online 24/7")
+    def log_message(self, format, *args): return
 
-TOKEN = os.getenv("BOT_TOKEN")
-BASE_DIR = Path(os.getenv("PATTERN_HOME", "patterns"))
-BASE_DIR.mkdir(parents=True, exist_ok=True)
+def run_health_server():
+    port = int(os.environ.get("PORT", 8080))
+    HTTPServer(('0.0.0.0', port), HealthCheckHandler).serve_forever()
 
-DATABASE = BASE_DIR / "patterns.sqlite3"
-
-dp = Dispatcher()
-
-
-def get_db():
-    connection = sqlite3.connect(DATABASE)
-    connection.execute(
-        """
-        CREATE TABLE IF NOT EXISTS patterns (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            pattern_name TEXT NOT NULL,
-            file_path TEXT NOT NULL,
-            created_at TEXT NOT NULL
-        )
-        """
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = (
+        "👗 *Garment AI Pattern & Drafting Engine Active!*\n\n"
+        "1️⃣ *Save Master Template:* CAD export `.dxf` file bhejiye — bot permanently save karega.\n"
+        "2️⃣ *Auto 2D CAD Drafting:* Kisi bhi new style ki Measurement Sheet bhejye — AI automatically 2D blueprint drafting image + Optitex-ready multi-piece DXF bana kar dega."
     )
-    connection.commit()
-    return connection
+    await update.message.reply_text(msg, parse_mode="Markdown")
 
+# 1. DXF Upload Handler
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    doc = update.message.document
+    if doc.file_name.lower().endswith(".dxf"):
+        status = await update.message.reply_text("📂 Processing & Saving Master Template DXF...")
+        f = await doc.get_file()
+        t_dxf = "temp_uploaded.dxf"
+        await f.download_to_drive(t_dxf)
+        
+        g_name = doc.file_name.replace(".dxf", "")
+        path, count = save_master_dxf(t_dxf, g_name)
+        
+        await status.delete()
+        await update.message.reply_text(f"✅ *Master Pattern Saved!* (`{count}` pieces recognized)\nAb jab bhi is type ki sheet aayegi, bot automatically execute karega.", parse_mode="Markdown")
+    else:
+        await update.message.reply_text("⚠️ Kripya `.dxf` pattern file bhejiye.")
 
-def save_pattern(user_id: int, pattern_name: str, file_path: str):
-    connection = get_db()
-    connection.execute(
-        """
-        INSERT INTO patterns
-        (user_id, pattern_name, file_path, created_at)
-        VALUES (?, ?, ?, ?)
-        """,
-        (
-            user_id,
-            pattern_name,
-            file_path,
-            datetime.utcnow().isoformat(),
-        ),
-    )
-    connection.commit()
-    connection.close()
+# 2. Spec Sheet Photo Handler
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    status = await update.message.reply_text("📐 Sheet analyze ho rahi hai... Drafting AI pattern...")
+    photo = await update.message.photo[-1].get_file()
+    img_path = "temp_spec.jpg"
+    await photo.download_to_drive(img_path)
 
+    with open(img_path, "rb") as f:
+        b64 = base64.b64encode(f.read()).decode('utf-8')
 
-def get_patterns(user_id: int):
-    connection = get_db()
-    rows = connection.execute(
-        """
-        SELECT id, pattern_name, file_path
-        FROM patterns
-        WHERE user_id = ?
-        ORDER BY id DESC
-        """,
-        (user_id,),
-    ).fetchall()
-    connection.close()
-    return rows
+    prompt = """
+    Analyze this garment spec sheet image. Extract measurement values into strictly valid JSON:
+    {
+      "garment_type": "blazer dress / jacket / top",
+      "size": "S",
+      "chest": 36.0,
+      "waist": 29.0,
+      "length": 34.0,
+      "shoulder": 13.5,
+      "sleeve_length": 20.0,
+      "armhole": 7.5
+    }
+    Output ONLY JSON.
+    """
 
-
-@dp.message(CommandStart())
-async def start_handler(message: Message):
-    await message.answer(
-        "Pattern bot ready.
-
-"
-        "/save_dxf - existing DXF save karein
-"
-        "/library - saved patterns dekhein
-"
-        "/newpattern - naya pattern banayein
-
-"
-        "Naye DXF ke liye JSON measurements bhejein."
-    )
-
-
-@dp.message(Command("save_dxf"))
-async def save_dxf_handler(message: Message):
-    await message.answer(
-        "Ab DXF/PDS file upload karein.
-"
-        "Caption mein pattern ka naam likhein."
-    )
-
-
-@dp.message(F.document)
-async def document_handler(message: Message, bot: Bot):
-    document = message.document
-    filename = document.file_name or "pattern.dxf"
-
-    if not filename.lower().endswith((".dxf", ".pds")):
-        await message.answer("Sirf DXF ya PDS file upload karein.")
-        return
-
-    pattern_name = (message.caption or Path(filename).stem).strip()
-    user_folder = BASE_DIR / str(message.from_user.id)
-    user_folder.mkdir(parents=True, exist_ok=True)
-
-    timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-    destination = user_folder / f"{timestamp}_{filename}"
-
-    telegram_file = await bot.get_file(document.file_id)
-    await bot.download_file(telegram_file.file_path, destination)
-
-    save_pattern(
-        user_id=message.from_user.id,
-        pattern_name=pattern_name,
-        file_path=str(destination),
-    )
-
-    await message.answer(
-        f"Pattern save ho gaya.
-"
-        f"Name: {pattern_name}
-"
-        f"Original file overwrite nahi hui."
-    )
-
-
-@dp.message(Command("library"))
-async def library_handler(message: Message):
-    rows = get_patterns(message.from_user.id)
-
-    if not rows:
-        await message.answer("Aapki pattern library empty hai.")
-        return
-
-    text = "
-".join(
-        f"{pattern_id} - {name}"
-        for pattern_id, name, file_path in rows
-    )
-
-    await message.answer("Saved patterns:
-
-" + text)
-
-
-@dp.message(Command("newpattern"))
-async def new_pattern_handler(message: Message):
-    await message.answer(
-        "Measurements JSON format mein bhejein:
-
-"
-        "{
-"
-        '  "length": 46,
-'
-        '  "bust": 38,
-'
-        '  "waist": 35,
-'
-        '  "hip": 43,
-'
-        '  "bottom_opening": 48,
-'
-        '  "shoulder": 15,
-'
-        '  "armhole": 8,
-'
-        '  "sleeve_length": 9,
-'
-        '  "sleeve_opening": 13,
-'
-        '  "neck_width": 7,
-'
-        '  "side_slit": 16
-'
-        "}"
-    )
-
-
-@dp.message(F.text)
-async def json_measurement_handler(message: Message):
-    text = message.text.strip()
-
-    if not text.startswith("{"):
-        return
-
+    spec = {"garment_type": "blazer dress", "size": "S", "chest": 36.0, "waist": 29.0, "length": 34.0, "shoulder": 13.5, "sleeve_length": 20.0, "armhole": 7.5}
     try:
-        measurements = json.loads(text)
-    except json.JSONDecodeError:
-        await message.answer("JSON format galat hai.")
-        return
-
-    required = [
-        "length",
-        "bust",
-        "waist",
-        "hip",
-        "bottom_opening",
-        "shoulder",
-        "armhole",
-    ]
-
-    missing = [field for field in required if field not in measurements]
-
-    if missing:
-        await message.answer(
-            "Yeh measurements missing hain:
-"
-            + ", ".join(missing)
+        res = requests.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"},
+            json={
+                "model": "meta-llama/llama-3.2-11b-vision-instruct:free",
+                "messages": [{"role": "user", "content": [{"type": "text", "text": prompt}, {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}]}]
+            },
+            timeout=40
         )
-        return
+        content = res.json()['choices'][0]['message']['content']
+        match = re.search(r'\{.*?\}', content, re.DOTALL)
+        if match:
+            spec = json.loads(match.group(0))
+    except Exception as e:
+        print("API error:", e)
 
-    user_folder = BASE_DIR / str(message.from_user.id)
-    user_folder.mkdir(parents=True, exist_ok=True)
+    dxf_out, png_out = generate_technical_draft_and_dxf(spec, "drafted_pattern.dxf", "blueprint.png")
 
-    timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-    output_file = user_folder / f"dress_{timestamp}.dxf"
-
-    try:
-        make_dress(measurements, str(output_file))
-    except Exception as error:
-        await message.answer(f"Pattern generate nahi hua: {error}")
-        return
-
-    await message.answer_document(
-        FSInputFile(output_file),
-        caption=(
-            "Basic DXF pattern generate ho gaya.
-"
-            "Optitex mein import karke measurements verify karein."
-        ),
+    caption = (
+        f"🎉 *Optitex 2D Pattern Draft Ready!*\n\n"
+        f"• Garment: `{spec.get('garment_type', 'Garment')}`\n"
+        f"• Size: `{spec.get('size', 'S')}`\n"
+        f"• Length: `{spec.get('length')}\"` | Chest/Bust: `{spec.get('chest')}\"`\n"
+        f"• Waist: `{spec.get('waist')}\"` | Shoulder: `{spec.get('shoulder')}\"`"
     )
 
+    await status.delete()
+    with open(png_out, "rb") as pf:
+        await update.message.reply_photo(photo=pf, caption=caption, parse_mode="Markdown")
+    with open(dxf_out, "rb") as df:
+        await update.message.reply_document(document=df, filename=f"{spec.get('size','S')}_{spec.get('garment_type','pattern')}.dxf")
 
-async def main():
-    if not TOKEN:
-        raise RuntimeError(
-            "BOT_TOKEN environment variable set nahi hai."
-        )
-
-    bot = Bot(TOKEN)
-    await dp.start_polling(bot)
-
+def main():
+    if not TELEGRAM_BOT_TOKEN: return
+    threading.Thread(target=run_health_server, daemon=True).start()
+    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).request(HTTPXRequest(connect_timeout=45.0, read_timeout=45.0)).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
