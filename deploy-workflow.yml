@@ -1,0 +1,87 @@
+name: Deploy to Render & Notify Telegram
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install --no-cache-dir -r requirements.txt
+          pip install --no-cache-dir matplotlib Pillow || echo "matplotlib/Pillow optional — skipping"
+
+      - name: Syntax check all Python files
+        run: |
+          for f in *.py; do
+            python -c "import ast; ast.parse(open('$f').read())" || exit 1
+            echo "  ✓ $f"
+          done
+
+      - name: Run end-to-end test
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: |
+          python -c "
+          from generator import Measurements, StyleDetails, draft_pieces, DXFExporter
+          m = Measurements(bust=92, waist=74, hip=98, shoulder_width=36, back_length=40,
+                          armhole_depth=20, neck_width=18, sleeve_length=60)
+          style = StyleDetails(silhouette='fitted', size_label='S')
+          pieces, engine = draft_pieces(m, garment_type='top', style=style)
+          exporter = DXFExporter()
+          exporter.export(pieces, 'test_ci.dxf', garment_type='top', measurements=m, size_label='S')
+          import os
+          assert os.path.exists('test_ci.dxf'), 'DXF generation failed!'
+          assert os.path.getsize('test_ci.dxf') > 1000, 'DXF too small!'
+          print(f'CI test passed — {len(pieces)} pieces, {os.path.getsize(\"test_ci.dxf\")} bytes DXF')
+          "
+
+      - name: Trigger Render deploy
+        if: env.RENDER_DEPLOY_HOOK_URL != ''
+        env:
+          RENDER_DEPLOY_HOOK_URL: ${{ secrets.RENDER_DEPLOY_HOOK_URL }}
+        run: |
+          echo "Triggering Render deploy hook..."
+          curl -s -X POST "$RENDER_DEPLOY_HOOK_URL" | tee render_response.json
+          echo ""
+          echo "Render deploy triggered successfully"
+
+      - name: Notify Telegram — Deploy Started
+        if: env.TELEGRAM_BOT_TOKEN != '' && env.TELEGRAM_CHAT_ID != ''
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          COMMIT_MSG=$(echo "${{ github.event.head_commit.message }}" | head -1)
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"chat_id\": \"${TELEGRAM_CHAT_ID}\",
+              \"text\": \"🚀 *Deploy triggered on Render*\n\nCommit: ${COMMIT_MSG}\nBy: ${{ github.actor }}\n\nThe bot will restart with the latest code in 1-2 minutes.\",
+              \"parse_mode\": \"Markdown\"
+            }"
+
+      - name: Notify Telegram — Deploy Failed
+        if: failure() && env.TELEGRAM_BOT_TOKEN != '' && env.TELEGRAM_CHAT_ID != ''
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"chat_id\": \"${TELEGRAM_CHAT_ID}\",
+              \"text\": \"❌ *Deploy FAILED*\n\nCheck GitHub Actions logs: ${{ github.server_url }}/${{ github.repository }}/actions\",
+              \"parse_mode\": \"Markdown\"
+            }"
