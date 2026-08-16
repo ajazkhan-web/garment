@@ -1,16 +1,15 @@
 """
-config.py — Configuration for the Apparel Pattern Drafting Bot.
-Sole AI provider: Google Gemini (free tier, multimodal vision).
-No OpenRouter — no fallback. Gemini is the only engine.
+config.py — Configuration for the Professional Apparel Pattern Drafting Bot.
+Sole AI provider: Google Gemini (multimodal vision + reasoning).
 """
+
 import os
 
 
 def _normalize_google_key(key: str) -> str:
-    """Google AI Studio's newer key format is 'AQ.<rest>'. Secret-scanning
-    tools sometimes split off the 'AQ.' prefix as plain text and store only
-    the '<rest>' part as the secret. Restore the prefix so the key validates.
-    Legacy keys (starting with 'AIza') are left untouched."""
+    """Google AI Studio keys use format 'AQ.<rest>'. Secret scanners sometimes
+    strip the 'AQ.' prefix — restore it automatically. Legacy 'AIza...' keys
+    are left untouched."""
     if not key:
         return key
     if key.startswith("AIza") or key.startswith("AQ."):
@@ -22,7 +21,6 @@ def _normalize_google_key(key: str) -> str:
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 
 # ─── AI Provider (Google Gemini ONLY) ───
-# Preference order: newest working key first, falling back down the chain.
 _KEY_CANDIDATES = [
     os.environ.get("GOOGLE_API_KEY_3", ""),
     os.environ.get("GOOGLE_API_KEY_2_2", ""),
@@ -35,52 +33,47 @@ for _k in _KEY_CANDIDATES:
         GOOGLE_API_KEY = _normalize_google_key(_k)
         break
 
-# gemini-2.5-flash / gemini-2.5-flash-lite are retired for new API keys.
-# gemini-flash-latest is the current model — it's a reasoning model, so we
-# disable "thinking" (thinkingBudget=0) at call time to avoid wasting the
-# token budget on invisible reasoning tokens.
-GEMINI_MODEL = "gemini-flash-latest"
-GEMINI_VISION_MODEL = "gemini-flash-latest"
-GEMINI_THINKING_BUDGET = 256  # small budget: enough to read the chart accurately
+# gemini-3.5-flash is the current available model (Aug 2026).
+# gemini-flash-latest gets 503 under load; 3.5-flash is stable.
+GEMINI_MODEL = "gemini-3.5-flash"
+GEMINI_VISION_MODEL = "gemini-3.5-flash"
 
-# Strict enforcement: Gemini is the sole AI provider. No fallback.
+# Reasoning budget: 256 tokens gives the model enough room to accurately
+# read measurement tables, identify garment types, and reason about style.
+GEMINI_THINKING_BUDGET = 256
+
+# Strict: Gemini is the sole AI provider. No fallback.
 DEFAULT_AI_PROVIDER = "gemini"
-USE_GEMINI = True
 
 # ─── AAMA DXF Layer Standards ───
-# AAMA-standard DXF layer names: key -> DXF layer name string
-# Matches the format expected by generator.py (string keys, string values)
 AAMA_LAYERS = {
-    "CUT":        "1",   # Main cut outline
-    "SEAM":       "8",   # Seam allowances / stitching lines
-    "GRAIN":      "4",   # Grainlines / internal reference
-    "NOTCH":      "3",   # Notch marks
-    "INTERNAL":   "4",   # Internal lines (darts, gathers)
-    "REFERENCE":  "6",   # Reference lines
-    "ANNOTATION": "7",   # Annotations, text labels
-    "MIRROR":     "9",   # Mirror / symmetry lines
+    "CUT":        "1",
+    "SEAM":       "8",
+    "GRAIN":      "4",
+    "NOTCH":      "3",
+    "INTERNAL":   "4",
+    "REFERENCE":  "6",
+    "ANNOTATION": "7",
+    "MIRROR":     "9",
 }
 
 # ─── Pattern Drafting Constants ───
 SEAM_ALLOWANCE = 1.0       # cm
 HEM_ALLOWANCE = 2.5        # cm
 OUTPUT_DIR = os.path.join(os.getcwd(), "output")
-DATABASE_PATH = os.path.join(os.getcwd(), "data", "templates.db")
+DATABASE_PATH = os.path.join(os.getcwd(), "pattern_references.db")
 TEMPLATE_DIR = os.path.join(os.getcwd(), "templates")
 
 # ─── Ease Values ───
-EASE_BODICE = {"minimal": 2.0, "standard": 4.0, "loose": 6.0}
-EASE_SKIRT = {"minimal": 2.0, "standard": 3.0, "loose": 5.0}
-
-DEFAULT_EASE = "standard"
 EASE_VALUES = {
     "minimal":  2.0,
     "standard": 4.0,
     "loose":    8.0,
 }
+DEFAULT_EASE = "standard"
 
-# ─── Template Database ───
-TEMPLATE_DB_PATH = os.environ.get("TEMPLATE_DB_PATH", "templates.db")
+# ─── Reference Library ───
+REFERENCE_DB_PATH = os.environ.get("REFERENCE_DB_PATH", "pattern_references.db")
 
 # ─── Bot Settings ───
 BOT_MODE = os.environ.get("BOT_MODE", "polling")
