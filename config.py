@@ -24,11 +24,17 @@ OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1/chat/completions"
 USE_GEMINI = bool(GOOGLE_API_KEY)
 
 # ─── AAMA DXF Layer Standards ───
+# AAMA-standard DXF layer names: key -> DXF layer name string
+# Matches the format expected by generator.py (string keys, string values)
 AAMA_LAYERS = {
-    1: {"name": "CUT",      "color": 7,   "desc": "Main cut outline"},
-    3: {"name": "INTERNAL", "color": 3,   "desc": "Internal lines (darts, gathers)"},
-    4: {"name": "SEAM",     "color": 5,   "desc": "Seam allowances / stitching lines"},
-    8: {"name": "ANNOT",    "color": 2,   "desc": "Annotations, text, grainlines"},
+    "CUT":        "1",   # Main cut outline
+    "SEAM":       "8",   # Seam allowances / stitching lines
+    "GRAIN":      "4",   # Grainlines / internal reference
+    "NOTCH":      "3",   # Notch marks
+    "INTERNAL":   "4",   # Internal lines (darts, gathers)
+    "REFERENCE":  "6",   # Reference lines
+    "ANNOTATION": "7",   # Annotations, text labels
+    "MIRROR":     "9",   # Mirror / symmetry lines
 }
 
 # ─── Pattern Drafting Constants ───
