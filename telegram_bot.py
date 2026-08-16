@@ -4,121 +4,137 @@ import base64
 import re
 import requests
 import threading
+import uuid
+import logging
+from pathlib import Path
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from dotenv import load_dotenv
+
 from telegram import Update
 from telegram.request import HTTPXRequest
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
-from generator import save_master_dxf, generate_technical_draft_and_dxf
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
+
+from generator import generate_technical_draft_and_dxf
 
 load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+
+PORT = int(os.getenv("PORT", "8080"))
+BASE_DIR = Path(__file__).resolve().parent
+TEMP_DIR = BASE_DIR / "temp"
+OUTPUT_DIR = BASE_DIR / "output"
+TEMP_DIR.mkdir(exist_ok=True)
+OUTPUT_DIR.mkdir(exist_ok=True)
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+logger = logging.getLogger("GarmentAI")
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
-        self.send_header('Content-type', 'text/plain')
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.end_headers()
-        self.wfile.write(b"Pattern AI Engine Online 24/7")
+        self.wfile.write(b"Garment AI Pattern Engine - Online")
     def log_message(self, format, *args): return
 
 def run_health_server():
-    port = int(os.environ.get("PORT", 8080))
-    HTTPServer(('0.0.0.0', port), HealthCheckHandler).serve_forever()
+    try:
+        server = HTTPServer(("0.0.0.0", PORT), HealthCheckHandler)
+        server.serve_forever()
+    except Exception as e:
+        logger.error(f"Server error: {e}")
+
+def analyze_sheet_fast(image_path):
+    default_data = {
+        "garment_type": "Poncho Top / Wrap Style",
+        "size": "S",
+        "measurements": {
+            "chest": "36",
+            "waist": "29",
+            "length_from_hps": "23",
+            "shoulder": "14",
+            "armhole": "7 1/2",
+            "sleeve_length_from_neck_seam": "22"
+        }
+    }
+    if not OPENROUTER_API_KEY:
+        return default_data
+
+    try:
+        with open(image_path, "rb") as f:
+            b64 = base64.b64encode(f.read()).decode("utf-8")
+
+        prompt = "Extract garment measurement JSON: {garment_type, size, measurements:{chest, waist, length_from_hps, shoulder, sleeve_length_from_neck_seam, armhole}}. Output strictly JSON."
+        headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"}
+        payload = {
+            "model": "meta-llama/llama-3.2-11b-vision-instruct:free",
+            "messages": [{"role": "user", "content": [{"type": "text", "text": prompt}, {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}]}]
+        }
+        res = requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=12)
+        if res.status_code == 200:
+            content = res.json()["choices"][0]["message"]["content"].replace("```json", "").replace("```", "").strip()
+            match = re.search(r'\{.*\}', content, re.DOTALL)
+            if match:
+                return json.loads(match.group(0))
+    except Exception as e:
+        logger.warning(f"Fast Vision fallback engaged: {e}")
+
+    return default_data
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = (
-        "👗 *Garment AI Pattern & Drafting Engine Active!*\n\n"
-        "1️⃣ *Save Master Template:* CAD export `.dxf` file bhejiye — bot permanently save karega.\n"
-        "2️⃣ *Auto 2D CAD Drafting:* Kisi bhi new style ki Measurement Sheet bhejye — AI automatically 2D blueprint drafting image + Optitex-ready multi-piece DXF bana kar dega."
-    )
-    await update.message.reply_text(msg, parse_mode="Markdown")
+    await update.message.reply_text("👗 *Garment CAD Pattern Generator Active!*\nManagement sheet bhejiye, bot turant Optitex DXF aur layout generate karega.", parse_mode="Markdown")
 
-# 1. DXF Upload Handler
-async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    doc = update.message.document
-    if doc.file_name.lower().endswith(".dxf"):
-        status = await update.message.reply_text("📂 Processing & Saving Master Template DXF...")
-        f = await doc.get_file()
-        t_dxf = "temp_uploaded.dxf"
-        await f.download_to_drive(t_dxf)
-        
-        g_name = doc.file_name.replace(".dxf", "")
-        path, count = save_master_dxf(t_dxf, g_name)
-        
-        await status.delete()
-        await update.message.reply_text(f"✅ *Master Pattern Saved!* (`{count}` pieces recognized)\nAb jab bhi is type ki sheet aayegi, bot automatically execute karega.", parse_mode="Markdown")
-    else:
-        await update.message.reply_text("⚠️ Kripya `.dxf` pattern file bhejiye.")
-
-# 2. Spec Sheet Photo Handler
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    status = await update.message.reply_text("📐 Sheet analyze ho rahi hai... Drafting AI pattern...")
-    photo = await update.message.photo[-1].get_file()
-    img_path = "temp_spec.jpg"
-    await photo.download_to_drive(img_path)
+    status = await update.message.reply_text("📸 Sheet receive ho gayi.\n⚙️ 2D CAD drafting process ho rahi hai...")
+    job_id = uuid.uuid4().hex[:8]
+    image_path = TEMP_DIR / f"{job_id}.jpg"
+    dxf_path = OUTPUT_DIR / f"{job_id}_pattern.dxf"
+    png_path = OUTPUT_DIR / f"{job_id}_preview.png"
 
-    with open(img_path, "rb") as f:
-        b64 = base64.b64encode(f.read()).decode('utf-8')
-
-    prompt = """
-    Analyze this garment spec sheet image. Extract measurement values into strictly valid JSON:
-    {
-      "garment_type": "blazer dress / jacket / top",
-      "size": "S",
-      "chest": 36.0,
-      "waist": 29.0,
-      "length": 34.0,
-      "shoulder": 13.5,
-      "sleeve_length": 20.0,
-      "armhole": 7.5
-    }
-    Output ONLY JSON.
-    """
-
-    spec = {"garment_type": "blazer dress", "size": "S", "chest": 36.0, "waist": 29.0, "length": 34.0, "shoulder": 13.5, "sleeve_length": 20.0, "armhole": 7.5}
     try:
-        res = requests.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"},
-            json={
-                "model": "meta-llama/llama-3.2-11b-vision-instruct:free",
-                "messages": [{"role": "user", "content": [{"type": "text", "text": prompt}, {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}]}]
-            },
-            timeout=40
+        photo = await update.message.photo[-1].get_file()
+        await photo.download_to_drive(str(image_path))
+
+        spec = analyze_sheet_fast(image_path)
+        dxf_out, png_out = generate_technical_draft_and_dxf(spec, str(dxf_path), str(png_path))
+
+        meas = spec.get("measurements", {})
+        caption = (
+            f"🎉 *Optitex 2D Pattern Draft Ready!*\n\n"
+            f"• Style: `{spec.get('garment_type', 'Garment')}`\n"
+            f"• Size: `{spec.get('size', 'S')}`\n"
+            f"• Length: `{meas.get('length_from_hps', '23')}\"` | Bust: `{meas.get('chest', '36')}\"`\n"
+            f"• Sleeve: `{meas.get('sleeve_length_from_neck_seam', '22')}\"`\n\n"
+            f"✅ Curved Sleeve Cap & Armholes\n"
+            f"✅ Optitex-Ready DXF"
         )
-        content = res.json()['choices'][0]['message']['content']
-        match = re.search(r'\{.*?\}', content, re.DOTALL)
-        if match:
-            spec = json.loads(match.group(0))
+
+        await status.delete()
+        with open(png_out, "rb") as pf:
+            await update.message.reply_photo(photo=pf, caption=caption, parse_mode="Markdown")
+        with open(dxf_out, "rb") as df:
+            await update.message.reply_document(document=df, filename=f"{spec.get('size','S')}_pattern.dxf")
+
     except Exception as e:
-        print("API error:", e)
-
-    dxf_out, png_out = generate_technical_draft_and_dxf(spec, "drafted_pattern.dxf", "blueprint.png")
-
-    caption = (
-        f"🎉 *Optitex 2D Pattern Draft Ready!*\n\n"
-        f"• Garment: `{spec.get('garment_type', 'Garment')}`\n"
-        f"• Size: `{spec.get('size', 'S')}`\n"
-        f"• Length: `{spec.get('length')}\"` | Chest/Bust: `{spec.get('chest')}\"`\n"
-        f"• Waist: `{spec.get('waist')}\"` | Shoulder: `{spec.get('shoulder')}\"`"
-    )
-
-    await status.delete()
-    with open(png_out, "rb") as pf:
-        await update.message.reply_photo(photo=pf, caption=caption, parse_mode="Markdown")
-    with open(dxf_out, "rb") as df:
-        await update.message.reply_document(document=df, filename=f"{spec.get('size','S')}_{spec.get('garment_type','pattern')}.dxf")
+        logger.exception("Error in handle_photo")
+        await status.edit_text(f"❌ Error: {str(e)[:300]}")
+    finally:
+        if image_path.exists():
+            image_path.unlink()
 
 def main():
     if not TELEGRAM_BOT_TOKEN: return
     threading.Thread(target=run_health_server, daemon=True).start()
-    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).request(HTTPXRequest(connect_timeout=45.0, read_timeout=45.0)).build()
+    
+    req = HTTPXRequest(connect_timeout=30.0, read_timeout=30.0)
+    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).request(req).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+
+    logger.info("Bot is active...")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
