@@ -1,134 +1,1268 @@
 import os
+import math
 import ezdxf
-import matplotlib.pyplot as plt
 import numpy as np
+import matplotlib.pyplot as plt
 
-def generate_curve(p0, p1, p2, num_pts=15):
-    """Quadratic Bézier curve generator for CAD armholes & sleeve caps"""
-    t = np.linspace(0, 1, num_pts)
-    curve = [(1-ti)**2 * np.array(p0) + 2*(1-ti)*ti * np.array(p1) + ti**2 * np.array(p2) for ti in t]
-    return [(float(pt[0]), float(pt[1])) for pt in curve]
 
-def generate_technical_draft_and_dxf(spec_data, out_dxf="drafted_pattern.dxf", out_png="blueprint.png"):
-    gtype = spec_data.get('garment_type', 'dress').lower()
-    chest = float(spec_data.get('chest', 36.0) or 36.0)
-    length = float(spec_data.get('length', 34.0) or 34.0)
-    shoulder = float(spec_data.get('shoulder', 13.5) or 13.5)
-    sleeve = float(spec_data.get('sleeve_length', 20.0) or 20.0)
-    waist = float(spec_data.get('waist', 29.0) or 28.0)
-    armhole = float(spec_data.get('armhole', 7.5) or 8.0)
-    pleat_count = int(spec_data.get('pleats', 4) if "pleat" in str(spec_data) else 0)
+# ============================================================
+# GARMENT AI PATTERN GENERATOR
+# ============================================================
+#
+# Input:
+#   AI extracted garment measurements
+#
+# Output:
+#   DXF technical pattern
+#   PNG technical preview
+#
+# NOTE:
+# This is an automated drafting engine.
+# Production patterns should be checked by a pattern technician.
+# ============================================================
 
-    half_ch = chest / 4.0
-    half_w = waist / 4.0
-    half_sh = shoulder / 2.0
-    sleeve_bicep = (chest * 0.35) / 2.0
 
-    # 1. Front Body Contours (Wrap / V-Neck + Armhole Curve)
-    front_hem = [(0, 0), (half_w + 3.5, 0)]
-    front_side = [(half_w + 1.5, length * 0.45), (half_ch + 0.5, length - armhole)]
-    
-    # Armhole Curve
-    ah_p0 = (half_ch + 0.5, length - armhole)
-    ah_ctrl = (half_sh - 0.5, length - armhole + 1.5)
-    ah_p1 = (half_sh, length - 1.5)
-    front_ah = generate_curve(ah_p0, ah_ctrl, ah_p1, 12)
-    
-    front_neck = [(3.25, length - 0.5), (0, length - 7.5)]
-    front_pts = front_hem + front_side + front_ah + front_neck
+# ============================================================
+# BASIC HELPERS
+# ============================================================
 
-    # 2. Back Body Contours
-    back_hem = [(0, 0), (half_w + 2.0, 0)]
-    back_side = [(half_w + 1.0, length * 0.45), (half_ch, length - armhole)]
-    back_ah = generate_curve((half_ch, length - armhole), (half_sh, length - armhole + 1.8), (half_sh, length - 1.5), 12)
-    back_neck = [(3.25, length - 0.5), (0, length - 1.2)]
-    back_pts = back_hem + back_side + back_ah + back_neck
+def to_float(value, default=None):
+    """
+    Safely convert a value to float.
 
-    # 3. Professional Sleeve with Curved Crown Cap
-    cap_height = armhole * 0.65
-    s_wrist = 4.5
-    sleeve_l_under = (0, 0)
-    sleeve_l_bicep = (0, sleeve - cap_height)
-    
-    # S-Curve Sleeve Cap
-    cap_left = generate_curve(sleeve_l_bicep, (sleeve_bicep * 0.4, sleeve - cap_height + 2.0), (sleeve_bicep, sleeve), 12)
-    cap_right = generate_curve((sleeve_bicep, sleeve), (sleeve_bicep * 1.6, sleeve - cap_height + 2.0), (sleeve_bicep * 2, sleeve - cap_height), 12)
-    sleeve_r_under = (sleeve_bicep * 2, 0)
-    sleeve_pts = [(0, 0)] + cap_left + cap_right + [sleeve_r_under, (s_wrist * 2, 0)]
+    Supports:
+        23
+        "23"
+        "2 1/2"
+        "3/4"
+        "23.5"
+    """
 
-    # 4. Collar / Facing
-    collar_pts = [(0, 0), (half_sh * 2.2, 0), (half_sh * 2.2, 2.5), (0, 2.5)]
+    if value is None:
+        return default
 
-    pieces = {
-        "FRONT_WRAP_PANEL": front_pts,
-        "BACK_PANEL": back_pts,
-        "SLEEVE_CROWN": sleeve_pts,
-        "COLLAR_FACING": collar_pts
+    if isinstance(value, (int, float)):
+        return float(value)
+
+    text = str(value).strip()
+
+    if not text:
+        return default
+
+    # Simple decimal
+    try:
+        return float(text)
+    except ValueError:
+        pass
+
+    # Mixed fraction e.g. 2 1/2
+    parts = text.replace('"', '').split()
+
+    try:
+
+        if len(parts) == 2 and "/" in parts[1]:
+
+            whole = float(parts[0])
+            numerator, denominator = parts[1].split("/")
+
+            return whole + (
+                float(numerator) / float(denominator)
+            )
+
+        # Simple fraction e.g. 3/4
+        if "/" in text:
+
+            numerator, denominator = text.split("/")
+
+            return (
+                float(numerator)
+                / float(denominator)
+            )
+
+    except Exception:
+        return default
+
+    return default
+
+
+# ============================================================
+# UNIT CONVERSION
+# ============================================================
+
+def convert_to_inches(value, unit="in"):
+
+    value = to_float(value)
+
+    if value is None:
+        return None
+
+    unit = str(unit).lower().strip()
+
+    if unit in ["cm", "centimeter", "centimeters"]:
+        return value / 2.54
+
+    if unit in ["mm", "millimeter", "millimeters"]:
+        return value / 25.4
+
+    return value
+
+
+def convert_to_cm(value, unit="in"):
+
+    value = to_float(value)
+
+    if value is None:
+        return None
+
+    unit = str(unit).lower().strip()
+
+    if unit in ["in", "inch", "inches", '"']:
+        return value * 2.54
+
+    if unit in ["mm", "millimeter", "millimeters"]:
+        return value / 10
+
+    return value
+
+
+# ============================================================
+# BEZIER CURVE
+# ============================================================
+
+def generate_curve(
+    p0,
+    p1,
+    p2,
+    num_pts=20
+):
+    """
+    Quadratic Bezier curve.
+    """
+
+    t = np.linspace(
+        0,
+        1,
+        num_pts
+    )
+
+    curve = []
+
+    for ti in t:
+
+        point = (
+            (1 - ti) ** 2 * np.array(p0)
+            +
+            2 * (1 - ti) * ti * np.array(p1)
+            +
+            ti ** 2 * np.array(p2)
+        )
+
+        curve.append(
+            (
+                float(point[0]),
+                float(point[1])
+            )
+        )
+
+    return curve
+
+
+# ============================================================
+# MEASUREMENT EXTRACTION
+# ============================================================
+
+def normalize_measurements(spec_data):
+
+    unit = spec_data.get(
+        "unit",
+        "in"
+    )
+
+    measurements = spec_data.get(
+        "measurements",
+        {}
+    )
+
+    # Support both:
+    #
+    # measurements: {...}
+    #
+    # AND old format:
+    #
+    # chest, waist, length...
+
+    def get_measurement(
+        new_name,
+        old_names=(),
+        default=None
+    ):
+
+        value = measurements.get(
+            new_name
+        )
+
+        if value is None:
+
+            for name in old_names:
+
+                if spec_data.get(name) is not None:
+
+                    value = spec_data.get(name)
+
+                    break
+
+        return convert_to_inches(
+            value,
+            unit
+        ) if value is not None else default
+
+    data = {
+
+        "length":
+            get_measurement(
+                "length_from_hps",
+                ["length"],
+                30
+            ),
+
+        "chest":
+            get_measurement(
+                "chest",
+                [],
+                36
+            ),
+
+        "waist":
+            get_measurement(
+                "waist",
+                [],
+                30
+            ),
+
+        "hip":
+            get_measurement(
+                "hip",
+                [],
+                38
+            ),
+
+        "shoulder":
+            get_measurement(
+                "shoulder",
+                [],
+                14
+            ),
+
+        "sleeve":
+            get_measurement(
+                "sleeve_length_from_neck_seam",
+                ["sleeve_length"],
+                20
+            ),
+
+        "neck_width":
+            get_measurement(
+                "boat_neck_width",
+                [],
+                7
+            ),
+
+        "front_neck_drop":
+            get_measurement(
+                "front_neck_drop",
+                [],
+                3
+            ),
+
+        "back_neck_drop":
+            get_measurement(
+                "back_neck_drop",
+                [],
+                1
+            ),
+
+        "sleeve_opening":
+            get_measurement(
+                "sleeve_opening_fabric_flat",
+                [],
+                8
+            ),
+
+        "sleeve_cuff_height":
+            get_measurement(
+                "sleeve_opening_full_height",
+                [],
+                1
+            ),
     }
 
-    # DXF & Matplotlib Setup
-    doc = ezdxf.new('R2010')
-    msp = doc.modelspace()
-    fig, ax = plt.subplots(figsize=(18, 8), facecolor='#FFFFFF')
-    ax.set_facecolor('#FFFFFF')
+    return data
 
-    current_x = 0.0
-    for name, pts in pieces.items():
-        arr = np.array(pts, dtype=float)
-        w = np.max(arr[:, 0]) - np.min(arr[:, 0])
-        arr[:, 0] += current_x
 
-        # Write DXF Polyline
-        poly = [(float(p[0]), float(p[1])) for p in arr]
-        msp.add_lwpolyline(poly, close=True, dxfattribs={'layer': name})
+# ============================================================
+# PATTERN SETTINGS
+# ============================================================
 
-        # Draw technical outlines
-        patch = plt.Polygon(arr, closed=True, facecolor='none', edgecolor='#1F3A24', linewidth=1.6)
-        ax.add_patch(patch)
+class PatternSettings:
 
-        cx, cy = np.mean(arr[:, 0]), np.mean(arr[:, 1])
-        ax.text(cx, cy, name, color='#1F3A24', weight='bold', fontsize=8, ha='center', va='center')
+    def __init__(
+        self,
+        seam_allowance=0.5,
+        hem_allowance=1.0,
+        scale=1.0
+    ):
 
-        # Grainline
-        ax.annotate('', xy=(cx, cy + 3.5), xytext=(cx, cy - 3.5), arrowprops=dict(arrowstyle='<->', color='#777', lw=1.0))
-        ax.text(cx + 0.4, cy, "GRAINLINE", rotation=90, fontsize=6, color='#777', va='center')
+        self.seam_allowance = seam_allowance
 
-        # Pleats & Notch marks on Front Panel
-        if "FRONT" in name and pleat_count > 0:
-            for p_i in range(pleat_count):
-                py = (length * 0.25) + (p_i * 1.25)
-                px = np.min(arr[:, 0]) + (half_w * 0.4)
-                ax.plot([px, px + 1.8], [py, py + 0.4], color='#D9381E', lw=1.2, linestyle='--')
-                ax.text(px + 2.0, py, f"Notch {p_i+1}", fontsize=6, color='#D9381E')
-                # Add Notch line to DXF
-                msp.add_line((float(px), float(py)), (float(px + 1.8), float(py + 0.4)), dxfattribs={'layer': 'NOTCHES'})
+        self.hem_allowance = hem_allowance
 
-        current_x += w + 6.0
+        self.scale = scale
 
-    doc.saveas(out_dxf)
 
-    # Tech Spec CAD Information Panel
-    info_str = (
-        f"CAD TECHNICAL DRAFT SPECIFICATION\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"• Garment: {spec_data.get('garment_type', 'Tailored Dress')}\n"
-        f"• Size: {spec_data.get('size', 'S')}\n"
-        f"• Length: {length}\" | Bust: {chest}\"\n"
-        f"• Waist: {waist}\" | Shoulder: {shoulder}\"\n"
-        f"• Sleeve: {sleeve}\" | Armhole: {armhole}\"\n"
-        f"• Pleats: {pleat_count} Pleats / Notches Marked\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"• Standards: 0.5\" Seam Allowance\n"
-        f"• Output: Optitex AAMA Polyline (.DXF)"
+# ============================================================
+# POINT HELPERS
+# ============================================================
+
+def offset_points(
+    points,
+    offset_x=0,
+    offset_y=0
+):
+
+    return [
+        (
+            float(x + offset_x),
+            float(y + offset_y)
+        )
+        for x, y in points
+    ]
+
+
+def bounds(points):
+
+    xs = [p[0] for p in points]
+
+    ys = [p[1] for p in points]
+
+    return (
+        min(xs),
+        max(xs),
+        min(ys),
+        max(ys)
     )
-    ax.text(current_x + 1.0, length * 0.4, info_str, fontsize=9, family='monospace', bbox=dict(boxstyle='round,pad=0.8', facecolor='#F6F8FA', edgecolor='#CBD5E1'))
 
-    ax.autoscale_view()
-    ax.set_aspect('equal')
-    ax.axis('off')
-    plt.title("Technical 2D Pattern Draft Layout & CAD Blueprints", fontsize=13, weight='bold', pad=15, color='#0F172A')
+
+# ============================================================
+# FRONT BODICE
+# ============================================================
+
+def build_front(
+    m,
+    settings
+):
+
+    chest = m["chest"]
+
+    waist = m["waist"]
+
+    length = m["length"]
+
+    shoulder = m["shoulder"]
+
+    armhole = max(
+        7.0,
+        chest / 6.0 + 1.0
+    )
+
+    # Quarter measurements
+
+    chest_q = chest / 4.0
+
+    waist_q = waist / 4.0
+
+    shoulder_half = shoulder / 2.0
+
+    # Main points
+
+    p0 = (0, 0)
+
+    p1 = (
+        chest_q,
+        0
+    )
+
+    p2 = (
+        waist_q,
+        length * 0.50
+    )
+
+    p3 = (
+        waist_q,
+        length
+    )
+
+    # Armhole
+
+    arm_start = (
+        chest_q,
+        length - armhole
+    )
+
+    shoulder_end = (
+        shoulder_half,
+        length - 1.0
+    )
+
+    arm_curve = generate_curve(
+        arm_start,
+        (
+            shoulder_half - 1.5,
+            length - armhole + 2
+        ),
+        shoulder_end,
+        20
+    )
+
+    # Neckline
+
+    neck_width = m["neck_width"]
+
+    neck_drop = m["front_neck_drop"]
+
+    neck_curve = generate_curve(
+        (
+            0,
+            length
+        ),
+        (
+            neck_width * 0.45,
+            length - neck_drop
+        ),
+        (
+            neck_width,
+            length - 0.5
+        ),
+        15
+    )
+
+    points = [
+
+        p0,
+
+        p1,
+
+        p2,
+
+        p3,
+
+        (shoulder_half, length - 1.0),
+
+    ]
+
+    points += list(
+        reversed(arm_curve)
+    )
+
+    points += list(
+        reversed(neck_curve)
+    )
+
+    return points
+
+
+# ============================================================
+# BACK BODICE
+# ============================================================
+
+def build_back(
+    m,
+    settings
+):
+
+    chest = m["chest"]
+
+    waist = m["waist"]
+
+    length = m["length"]
+
+    shoulder = m["shoulder"]
+
+    chest_q = chest / 4
+
+    waist_q = waist / 4
+
+    shoulder_half = shoulder / 2
+
+    armhole = max(
+        7,
+        chest / 6 + 1
+    )
+
+    arm_start = (
+        chest_q,
+        length - armhole
+    )
+
+    shoulder_end = (
+        shoulder_half,
+        length - 1
+    )
+
+    arm_curve = generate_curve(
+        arm_start,
+        (
+            shoulder_half - 1,
+            length - armhole + 2
+        ),
+        shoulder_end,
+        20
+    )
+
+    neck_width = m["neck_width"]
+
+    neck_drop = m["back_neck_drop"]
+
+    neck_curve = generate_curve(
+        (
+            0,
+            length
+        ),
+        (
+            neck_width * 0.45,
+            length - neck_drop
+        ),
+        (
+            neck_width,
+            length - 0.5
+        ),
+        15
+    )
+
+    points = [
+
+        (0, 0),
+
+        (chest_q, 0),
+
+        (waist_q, length * 0.5),
+
+        (waist_q, length),
+
+        shoulder_end
+
+    ]
+
+    points += list(
+        reversed(arm_curve)
+    )
+
+    points += list(
+        reversed(neck_curve)
+    )
+
+    return points
+
+
+# ============================================================
+# SLEEVE
+# ============================================================
+
+def build_sleeve(
+    m,
+    settings
+):
+
+    sleeve_length = m["sleeve"]
+
+    chest = m["chest"]
+
+    sleeve_opening = m[
+        "sleeve_opening"
+    ]
+
+    armhole = max(
+        7,
+        chest / 6 + 1
+    )
+
+    sleeve_width = (
+        armhole * 0.85
+    )
+
+    cap_height = (
+        armhole * 0.65
+    )
+
+    top_y = sleeve_length
+
+    left = (
+        0,
+        0
+    )
+
+    left_cap = (
+        0,
+        top_y - cap_height
+    )
+
+    center = (
+        sleeve_width,
+        top_y
+    )
+
+    right_cap = (
+        sleeve_width * 2,
+        top_y - cap_height
+    )
+
+    right = (
+        sleeve_width * 2,
+        0
+    )
+
+    left_curve = generate_curve(
+        left_cap,
+        (
+            sleeve_width * 0.30,
+            top_y + 0.5
+        ),
+        center,
+        20
+    )
+
+    right_curve = generate_curve(
+        center,
+        (
+            sleeve_width * 1.70,
+            top_y + 0.5
+        ),
+        right_cap,
+        20
+    )
+
+    cuff_width = max(
+        sleeve_opening,
+        3
+    )
+
+    points = [
+
+        left,
+
+        left_cap
+
+    ]
+
+    points += left_curve
+
+    points += right_curve
+
+    points += [
+
+        right_cap,
+
+        right,
+
+        (
+            cuff_width * 2,
+            0
+        )
+
+    ]
+
+    return points
+
+
+# ============================================================
+# NECK FACING
+# ============================================================
+
+def build_facing(
+    m,
+    settings
+):
+
+    width = max(
+        m["neck_width"] * 2,
+        10
+    )
+
+    depth = 2.5
+
+    return [
+
+        (0, 0),
+
+        (width, 0),
+
+        (width, depth),
+
+        (0, depth)
+
+    ]
+
+
+# ============================================================
+# SEAM ALLOWANCE
+# ============================================================
+
+def add_seam_allowance(
+    points,
+    allowance
+):
+
+    """
+    Basic outward allowance representation.
+
+    NOTE:
+    This is a drafting approximation.
+    For production-grade nested CAD,
+    use a proper geometric offset engine.
+    """
+
+    result = []
+
+    min_x, max_x, min_y, max_y = bounds(
+        points
+    )
+
+    for x, y in points:
+
+        new_x = x
+
+        new_y = y
+
+        if abs(x - min_x) < 0.0001:
+            new_x -= allowance
+
+        if abs(x - max_x) < 0.0001:
+            new_x += allowance
+
+        if abs(y - min_y) < 0.0001:
+            new_y -= allowance
+
+        if abs(y - max_y) < 0.0001:
+            new_y += allowance
+
+        result.append(
+            (
+                new_x,
+                new_y
+            )
+        )
+
+    return result
+
+
+# ============================================================
+# GRAINLINE
+# ============================================================
+
+def add_grainline(
+    msp,
+    cx,
+    cy,
+    length=8
+):
+
+    msp.add_line(
+
+        (
+            cx,
+            cy - length / 2
+        ),
+
+        (
+            cx,
+            cy + length / 2
+        ),
+
+        dxfattribs={
+            "layer": "GRAINLINE"
+        }
+
+    )
+
+
+# ============================================================
+# NOTCH
+# ============================================================
+
+def add_notch(
+    msp,
+    x,
+    y,
+    size=0.25
+):
+
+    msp.add_line(
+
+        (
+            x - size,
+            y
+        ),
+
+        (
+            x + size,
+            y
+        ),
+
+        dxfattribs={
+            "layer": "NOTCH"
+        }
+
+    )
+
+
+# ============================================================
+# TEXT LABEL
+# ============================================================
+
+def add_label(
+    msp,
+    x,
+    y,
+    text,
+    height=0.25
+):
+
+    msp.add_text(
+        text,
+        dxfattribs={
+            "layer": "ANNOTATION",
+            "height": height
+        }
+    ).set_placement(
+        (
+            x,
+            y
+        )
+    )
+
+
+# ============================================================
+# DXF LAYERS
+# ============================================================
+
+def create_layers(doc):
+
+    layers = {
+
+        "PATTERN": 1,
+
+        "SEAM_ALLOWANCE": 2,
+
+        "GRAINLINE": 3,
+
+        "NOTCH": 4,
+
+        "ANNOTATION": 5,
+
+        "CENTER_LINE": 6,
+
+        "INTERNAL": 7
+
+    }
+
+    for name, color in layers.items():
+
+        if name not in doc.layers:
+
+            doc.layers.add(
+                name,
+                color=color
+            )
+
+
+# ============================================================
+# DRAW PIECE
+# ============================================================
+
+def draw_piece(
+    msp,
+    ax,
+    name,
+    points,
+    current_x,
+    settings,
+    add_allowance=True
+):
+
+    pts = offset_points(
+        points,
+        current_x,
+        0
+    )
+
+    # Main pattern
+
+    msp.add_lwpolyline(
+
+        pts,
+
+        close=True,
+
+        dxfattribs={
+            "layer": "PATTERN"
+        }
+
+    )
+
+    # Seam allowance
+
+    if add_allowance:
+
+        sa_points = add_seam_allowance(
+            points,
+            settings.seam_allowance
+        )
+
+        sa_points = offset_points(
+            sa_points,
+            current_x,
+            0
+        )
+
+        msp.add_lwpolyline(
+
+            sa_points,
+
+            close=True,
+
+            dxfattribs={
+                "layer": "SEAM_ALLOWANCE"
+            }
+
+        )
+
+    # Technical preview
+
+    arr = np.array(
+        pts,
+        dtype=float
+    )
+
+    ax.plot(
+
+        arr[:, 0],
+        arr[:, 1],
+
+        linewidth=1.5,
+
+        label=name
+
+    )
+
+    # Center
+
+    cx = float(
+        np.mean(arr[:, 0])
+    )
+
+    cy = float(
+        np.mean(arr[:, 1])
+    )
+
+    # Piece label
+
+    ax.text(
+
+        cx,
+        cy,
+
+        name,
+
+        fontsize=8,
+
+        weight="bold",
+
+        ha="center",
+
+        va="center"
+
+    )
+
+    # Grainline
+
+    add_grainline(
+        msp,
+        cx,
+        cy
+    )
+
+    ax.annotate(
+
+        "",
+
+        xy=(
+            cx,
+            cy + 4
+        ),
+
+        xytext=(
+            cx,
+            cy - 4
+        ),
+
+        arrowprops={
+            "arrowstyle": "<->",
+            "linewidth": 1
+        }
+
+    )
+
+    ax.text(
+        cx + 0.3,
+        cy,
+        "GRAINLINE",
+        rotation=90,
+        fontsize=5,
+        va="center"
+    )
+
+    # Center line
+
+    min_x, max_x, min_y, max_y = bounds(
+        pts
+    )
+
+    msp.add_line(
+
+        (
+            cx,
+            min_y
+        ),
+
+        (
+            cx,
+            max_y
+        ),
+
+        dxfattribs={
+            "layer": "CENTER_LINE"
+        }
+
+    )
+
+    return max_x - min_x
+
+
+# ============================================================
+# MAIN GENERATOR
+# ============================================================
+
+def generate_technical_draft_and_dxf(
+
+    spec_data,
+
+    out_dxf="drafted_pattern.dxf",
+
+    out_png="blueprint.png"
+
+):
+
+    # --------------------------------------------------------
+    # Normalize data
+    # --------------------------------------------------------
+
+    m = normalize_measurements(
+        spec_data
+    )
+
+    garment_type = str(
+        spec_data.get(
+            "garment_type",
+            "Garment"
+        )
+    )
+
+    size = spec_data.get(
+        "size",
+        "S"
+    )
+
+    settings = PatternSettings(
+        seam_allowance=0.5,
+        hem_allowance=1.0
+    )
+
+    # --------------------------------------------------------
+    # Build pattern pieces
+    # --------------------------------------------------------
+
+    pieces = {
+
+        "FRONT": build_front(
+            m,
+            settings
+        ),
+
+        "BACK": build_back(
+            m,
+            settings
+        ),
+
+        "SLEEVE": build_sleeve(
+            m,
+            settings
+        ),
+
+        "NECK_FACING": build_facing(
+            m,
+            settings
+        )
+
+    }
+
+    # --------------------------------------------------------
+    # Create DXF
+    # --------------------------------------------------------
+
+    doc = ezdxf.new(
+        "R2010"
+    )
+
+    create_layers(
+        doc
+    )
+
+    msp = doc.modelspace()
+
+    # --------------------------------------------------------
+    # Preview
+    # --------------------------------------------------------
+
+    fig, ax = plt.subplots(
+        figsize=(18, 10)
+    )
+
+    current_x = 0
+
+    spacing = 8
+
+    # --------------------------------------------------------
+    # Draw pieces
+    # --------------------------------------------------------
+
+    for name, points in pieces.items():
+
+        width = draw_piece(
+
+            msp,
+
+            ax,
+
+            name,
+
+            points,
+
+            current_x,
+
+            settings
+
+        )
+
+        current_x += (
+            width + spacing
+        )
+
+    # --------------------------------------------------------
+    # Add technical information
+    # --------------------------------------------------------
+
+    info_x = current_x
+
+    info_y = m["length"] * 0.8
+
+    info_lines = [
+
+        "GARMENT AI PATTERN",
+
+        "────────────────────────",
+
+        f"Garment: {garment_type}",
+
+        f"Size: {size}",
+
+        "",
+
+        "MEASUREMENTS",
+
+        f"Chest: {m['chest']:.2f}\"",
+
+        f"Waist: {m['waist']:.2f}\"",
+
+        f"Hip: {m['hip']:.2f}\"",
+
+        f"Length: {m['length']:.2f}\"",
+
+        f"Shoulder: {m['shoulder']:.2f}\"",
+
+        f"Sleeve: {m['sleeve']:.2f}\"",
+
+        "",
+
+        "CONSTRUCTION",
+
+        "Seam Allowance: 0.50\"",
+
+        "Hem Allowance: 1.00\"",
+
+        "Grainline: Marked",
+
+        "Notches: Marked",
+
+        "",
+
+        "OUTPUT",
+
+        "DXF R2010",
+
+        "Units: Inch"
+
+    ]
+
+    for i, line in enumerate(
+        info_lines
+    ):
+
+        ax.text(
+
+            info_x,
+
+            info_y - (
+                i * 1.0
+            ),
+
+            line,
+
+            fontsize=8,
+
+            family="monospace"
+
+        )
+
+    # --------------------------------------------------------
+    # Preview settings
+    # --------------------------------------------------------
+
+    ax.set_aspect(
+        "equal",
+        adjustable="datalim"
+    )
+
+    ax.axis(
+        "off"
+    )
+
+    ax.set_title(
+        "GARMENT AI — TECHNICAL PATTERN DRAFT",
+        fontsize=15,
+        weight="bold"
+    )
+
     plt.tight_layout()
-    plt.savefig(out_png, dpi=250, bbox_inches='tight')
-    plt.close(fig)
 
-    return out_dxf, out_png
+    # --------------------------------------------------------
+    # Save files
+    # ------------------------------
