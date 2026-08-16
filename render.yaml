@@ -3,7 +3,7 @@ services:
     name: apparel-pattern-bot
     env: python
     branch: main
-    buildCommand: pip install --no-cache-dir -r requirements.txt
+    buildCommand: pip install --no-cache-dir -r requirements.txt && pip install --no-cache-dir matplotlib Pillow || echo "matplotlib/Pillow install failed — bot will run without blueprint preview"
     startCommand: python telegram_bot.py
     envVars:
       - key: OPENROUTER_API_KEY
