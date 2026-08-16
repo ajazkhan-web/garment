@@ -20,8 +20,12 @@ OPENROUTER_VISION_MODEL = "anthropic/claude-sonnet-4"
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 # ─── Which provider to use ───
-# If GOOGLE_API_KEY is set, use Gemini (free). Otherwise use OpenRouter.
-USE_GEMINI = bool(GOOGLE_API_KEY)
+# Google Gemini is the strict PRIMARY engine (free tier).
+# OpenRouter is a runtime fallback only used if Gemini fails.
+DEFAULT_AI_PROVIDER = "gemini"   # "gemini" (primary) or "openrouter"
+USE_GEMINI = True               # Always try Gemini first
+# If Gemini key is missing, we'll log a warning but still try at runtime
+# (the key might be injected by the hosting platform after startup).
 
 # ─── AAMA DXF Layer Standards ───
 # AAMA-standard DXF layer names: key -> DXF layer name string
