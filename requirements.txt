@@ -1,6 +1,5 @@
-python-telegram-bot
-ezdxf
-matplotlib
-numpy
-requests
-python-dotenv
+python-telegram-bot==21.6
+ezdxf==1.3.5
+httpx==0.27.2
+Pillow==10.4.0
+aiofiles==24.1.0
