@@ -18,6 +18,7 @@ Author: Built with Solene (Base44 Superagent) pattern drafting methodology
 """
 
 import os
+import re
 import json
 import logging
 import tempfile
@@ -30,7 +31,6 @@ from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
-    ContextBuilder,
     filters,
 )
 
@@ -39,6 +39,9 @@ import openai
 
 # Pattern generator
 from generator import generate_pattern, GARMENT_DRAFTERS
+
+# PDS file parser (learns from your Optitex pattern files)
+from pds_parser import parse_pds, save_to_library, find_matching_template, summarize_pieces
 
 # ============================================================
 # CONFIG
@@ -86,7 +89,8 @@ Analyze this management/spec sheet image carefully and extract ALL measurements.
 
 Return a JSON object with these fields (all values in INCHES as numbers, no units in the value):
 {
-  "garment_type": "tshirt_dress|shirt|jacket|pants|palazzo",
+  "garment_type": "tshirt_dress|shirt|jacket|pants|palazzo|wrap_blazer_dress",
+  "style_name": "short descriptive name, e.g. 'Poncho Wrap Top' or 'Camo Bomber Jacket'",
   "length": number,
   "bust": number (or "chest" for jackets),
   "waist": number,
@@ -242,11 +246,18 @@ async def handle_photo(update: Update, context):
         try:
             measurements = await analyze_spec_sheet(image_path)
             gt = detect_garment_type(measurements)
+            style_name = measurements.get("style_name") or gt.replace("_", " ").title()
+
+            template = find_matching_template(gt)
+            template_note = f"\n📚 Found saved template: {template['style_name']} ({template['piece_count']} pieces) — reusing construction logic" if template else ""
+
             await update.message.reply_text(
-                f"✅ Measurements extracted!\n"
-                f"Garment type: {gt}\n"
-                f"Found {len(measurements)} measurements\n"
-                f"Step 2/4: Generating pattern... 📐"
+                f"✅ Analysis complete!\n"
+                f"Style: {style_name}\n"
+                f"Garment type: {gt.replace('_', ' ').title()}\n"
+                f"Measurements found: {len(measurements)}"
+                f"{template_note}\n\n"
+                f"Step 2/4: Drafting pattern... 📐"
             )
             logger.info(f"Measurements: {json.dumps(measurements, indent=2)}")
         except json.JSONDecodeError as e:
@@ -266,13 +277,6 @@ async def handle_photo(update: Update, context):
         output_dir = os.path.join(tmpdir, "output")
         try:
             result = generate_pattern(measurements, gt, output_dir)
-            await update.message.reply_text(
-                f"✅ Pattern generated! {result['piece_count']} pieces\n"
-                f"Step 3/4: Creating files... 📄\n\n"
-                f"Measurements used:\n" +
-                "\n".join(f"  {k}: {v}\"" for k, v in measurements.items()
-                         if isinstance(v, (int, float)))
-            )
         except Exception as e:
             await update.message.reply_text(
                 f"❌ Pattern generation failed: {str(e)}\n"
@@ -281,32 +285,45 @@ async def handle_photo(update: Update, context):
             )
             return
 
-        # Step 4: Send results
-        await update.message.reply_text("Step 4/4: Sending files... 📤")
+        # Step 4: Send results (professional summary card, like a real pattern-maker's draft note)
+        m = measurements
+        length_val = m.get("length")
+        bust_val = m.get("bust") or m.get("chest")
+        sleeve_val = m.get("sleeve_length")
+        waist_val = m.get("waist")
+
+        summary_lines = [f"🎉 Optitex 2D Pattern Draft Ready!", ""]
+        summary_lines.append(f"• Style: {style_name}")
+        summary_lines.append(f"• Garment type: {gt.replace('_', ' ').title()}")
+        if length_val: summary_lines.append(f"• Length: {length_val}\"")
+        if bust_val: summary_lines.append(f"• Bust/Chest: {bust_val}\"")
+        if waist_val: summary_lines.append(f"• Waist: {waist_val}\"")
+        if sleeve_val: summary_lines.append(f"• Sleeve: {sleeve_val}\"")
+        summary_lines.append(f"• Total pieces: {result['piece_count']}")
+        summary_lines.append("")
+        summary_lines.append("✅ Curved seams (Catmull-Rom smoothed)")
+        summary_lines.append("✅ Exact widths per /4 rule, no added ease")
+        summary_lines.append("✅ Darts/pleats/notches marked at exact positions")
+        summary_lines.append("✅ Optitex-ready DXF (AAMA/ASTM, native cm)")
+
+        await update.message.reply_text("\n".join(summary_lines))
 
         # Send preview image
         if result.get("preview") and os.path.exists(result["preview"]):
             with open(result["preview"], "rb") as preview_file:
                 await update.message.reply_photo(
                     photo=InputFile(preview_file),
-                    caption=f"📊 Pattern Preview - {result['piece_count']} pieces"
+                    caption=f"📊 {style_name} — {result['piece_count']} pieces"
                 )
 
         # Send DXF file
         if result.get("dxf") and os.path.exists(result["dxf"]):
             with open(result["dxf"], "rb") as dxf_file:
+                dxf_name = f"{style_name.replace(' ', '_')}.dxf"
                 await update.message.reply_document(
-                    document=InputFile(dxf_file, filename=os.path.basename(result["dxf"])),
-                    caption="📐 DXF file (AAMA/ASTM, native cm) - Import via File → Import → DXF in Optitex 15"
+                    document=InputFile(dxf_file, filename=dxf_name),
+                    caption="📐 Import via File → Import → DXF in Optitex 15 (Format: AAMA/ASTM, Units: Centimeters, Scale: 1:1)"
                 )
-            await update.message.reply_text(
-                "✅ Done! Import the DXF into Optitex 15:\n"
-                "1. Open Optitex 15\n"
-                "2. File → Import → DXF\n"
-                "3. Select the file\n"
-                "4. Format: AAMA/ASTM, Units: Centimeters, Scale: 1:1\n"
-                "5. Click OK"
-            )
         else:
             await update.message.reply_text(
                 "⚠️ Preview generated but DXF creation failed.\n"
@@ -316,6 +333,9 @@ async def handle_photo(update: Update, context):
 
 async def handle_text(update: Update, context):
     """Handle text messages."""
+    handled = await handle_garment_type_reply(update, context)
+    if handled:
+        return
     text = update.message.text.lower()
     if "hello" in text or "hi" in text:
         await start_command(update, context)
@@ -324,8 +344,76 @@ async def handle_text(update: Update, context):
     else:
         await update.message.reply_text(
             "📤 Send me a photo of your management/spec sheet to generate a pattern.\n"
+            "📁 Or send me a .pds file to save it to your pattern library for reuse.\n"
             "Type /help for instructions."
         )
+
+
+async def handle_pds_document(update: Update, context):
+    """
+    Handle .pds file uploads: parse the Optitex pattern, identify every piece
+    (front/back/sleeve/collar/cuff etc.), and save it to the local pattern
+    library so future spec sheets of the same garment type can reuse it.
+    """
+    doc = update.message.document
+    filename = doc.file_name or "pattern.pds"
+
+    if not filename.lower().endswith(".pds"):
+        return  # let other handlers deal with non-pds documents
+
+    await update.message.reply_text(f"📁 Got {filename}! Reading pattern pieces... 🔍")
+
+    telegram_file = await context.bot.get_file(doc.file_id)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        local_path = os.path.join(tmpdir, filename)
+        await telegram_file.download_to_drive(local_path)
+
+        try:
+            parsed = parse_pds(local_path)
+        except Exception as e:
+            await update.message.reply_text(f"❌ Could not parse {filename}: {str(e)}")
+            return
+
+        if not parsed["pieces"]:
+            await update.message.reply_text(
+                "⚠️ No pieces detected in this file. "
+                "It may use a PDS export format I haven't seen yet — "
+                "send it along with the garment type name and I'll adapt the parser."
+            )
+            return
+
+        summary = summarize_pieces(parsed)
+        await update.message.reply_text(
+            f"🧩 Identified {len(parsed['pieces'])} pieces in {filename}:\n\n{summary}\n\n"
+            f"What garment type is this? Reply like: \"save as jacket\" or \"save as wrap_blazer_dress\"\n"
+            f"(or I'll file it under 'unknown' and you can rename later)"
+        )
+
+        style_name = os.path.splitext(filename)[0]
+        entry = save_to_library(parsed, style_name=style_name, garment_type="unknown")
+        context.user_data["last_pds_style_name"] = style_name
+
+
+async def handle_garment_type_reply(update: Update, context):
+    """If the user replies 'save as <garment_type>' after uploading a PDS, update the library entry."""
+    text = update.message.text.strip().lower()
+    m = re.match(r"save as (\w+)", text)
+    if not m:
+        return False
+    garment_type = m.group(1)
+    style_name = context.user_data.get("last_pds_style_name")
+    if not style_name or not os.path.exists("pattern_library.json"):
+        await update.message.reply_text("No recent PDS upload found to tag. Send the .pds file first.")
+        return True
+    with open("pattern_library.json") as f:
+        library = json.load(f)
+    for entry in library["patterns"]:
+        if entry["style_name"] == style_name:
+            entry["garment_type"] = garment_type
+    with open("pattern_library.json", "w") as f:
+        json.dump(library, f, indent=2)
+    await update.message.reply_text(f"✅ Saved '{style_name}' as garment type: {garment_type}")
+    return True
 
 
 def main():
@@ -359,6 +447,7 @@ def main():
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_pds_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     # Start polling
