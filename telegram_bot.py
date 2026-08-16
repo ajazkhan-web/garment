@@ -536,7 +536,32 @@ async def _download_telegram_file(bot, file_id: str) -> tuple[bytes, str]:
     tg_file = await bot.get_file(file_id)
     buf = io.BytesIO()
     await tg_file.download_to_memory(buf)
-    return buf.getvalue(), tg_file.mime_type or "image/jpeg"
+    data = buf.getvalue()
+    # Detect MIME type from magic bytes (python-telegram-bot's File object
+    # does not expose .mime_type, so we sniff it ourselves)
+    mime = "image/jpeg"  # default
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        mime = "image/png"
+    elif data[:3] == b"\xff\xd8\xff":
+        mime = "image/jpeg"
+    elif data[:6] in (b"GIF87a", b"GIF89a"):
+        mime = "image/gif"
+    elif data[:12] == b"RIFF" and data[8:12] == b"WEBP":
+        mime = "image/webp"
+    elif data[:2] == b"BM":
+        mime = "image/bmp"
+    elif data[:4] == b"\x00\x00\x01\x00":
+        mime = "image/x-icon"
+    elif data[:4] == b"\x4f\x46\x54\x4f":
+        mime = "font/otf"
+    # Fallback: try to infer from the Telegram file_path extension
+    if hasattr(tg_file, "file_path") and tg_file.file_path:
+        ext = tg_file.file_path.lower().rsplit(".", 1)[-1] if "." in tg_file.file_path else ""
+        ext_map = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
+                   "gif": "image/gif", "webp": "image/webp", "bmp": "image/bmp"}
+        if ext in ext_map:
+            mime = ext_map[ext]
+    return data, mime
 
 
 # ====================================================================
