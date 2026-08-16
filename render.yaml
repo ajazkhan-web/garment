@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: apparel-pattern-bot
+    env: python
+    repo: <your-github-repo-url>
+    branch: main
+    buildCommand: pip install -r requirements.txt
+    startCommand: python telegram_bot.py
+    envVars:
+      - key: OPENROUTER_API_KEY
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: BOT_MODE
+        value: polling
+      - key: DATABASE_URL
+        sync: false
