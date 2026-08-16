@@ -37,17 +37,18 @@ EASE_SKIRT = {
     "standard": 3.0,
     "loose": 5.0,
 }
-SEAM_ALLOWANCE = 1.0   # cm default
+SEAM_ALLOWANCE = 1.0   # cm default (~0.5in noted in annotations)
 HEM_ALLOWANCE = 2.5     # cm default
 
-# AAMA DXF Layer names (industry standard)
+# AAMA DXF Layer standard, per spec:
+# 1 = Cut lines, 8 = Seam lines, 4 = Internal/Grainline, 3 = Notches
 AAMA_LAYERS = {
     "CUT":           "1",    # Cutting outline
-    "SEAM":          "5",    # Seam lines
-    "GRAIN":         "7",    # Grainlines
-    "NOTCH":         "8",    # Notches
-    "INTERNAL":      "3",    # Internal lines (darts, drill marks)
-    "REFERENCE":     "4",    # Reference / construction lines
-    "ANNOTATION":    "6",    # Text annotations
-    "MIRROR":        "9",    # Mirror lines
+    "SEAM":          "8",    # Seam lines (inside SA)
+    "GRAIN":         "4",    # Grainlines (shares Internal layer per spec)
+    "NOTCH":         "3",    # Notches / balance points
+    "INTERNAL":      "4",    # Internal lines (darts, fold/gather guides)
+    "REFERENCE":     "6",    # Reference / construction lines (hip line, elbow line)
+    "ANNOTATION":    "7",    # Text annotations (piece name, size, cut qty)
+    "MIRROR":        "9",    # Mirror / fold lines (CF/CB)
 }
