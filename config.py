@@ -1,31 +1,21 @@
 """
 config.py — Configuration for the Apparel Pattern Drafting Bot.
-Supports dual AI providers: Google Gemini (primary, free) + OpenRouter (fallback).
+Sole AI provider: Google Gemini (free tier, multimodal vision).
+No OpenRouter — no fallback. Gemini is the only engine.
 """
 import os
 
 # ─── Telegram ───
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 
-# ─── AI Provider Selection ───
-# Primary: Google Gemini (free tier, multimodal)
+# ─── AI Provider (Google Gemini ONLY) ───
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "")
 GEMINI_MODEL = "gemini-2.5-flash"          # fast, free tier, multimodal
 GEMINI_VISION_MODEL = "gemini-2.5-flash"   # same model handles text+image
 
-# Fallback: OpenRouter (Claude Sonnet 4, paid)
-OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
-OPENROUTER_MODEL = "anthropic/claude-sonnet-4"
-OPENROUTER_VISION_MODEL = "anthropic/claude-sonnet-4"
-OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1/chat/completions"
-
-# ─── Which provider to use ───
-# Google Gemini is the strict PRIMARY engine (free tier).
-# OpenRouter is a runtime fallback only used if Gemini fails.
-DEFAULT_AI_PROVIDER = "gemini"   # "gemini" (primary) or "openrouter"
-USE_GEMINI = True               # Always try Gemini first
-# If Gemini key is missing, we'll log a warning but still try at runtime
-# (the key might be injected by the hosting platform after startup).
+# Strict enforcement: Gemini is the sole AI provider. No fallback.
+DEFAULT_AI_PROVIDER = "gemini"
+USE_GEMINI = True
 
 # ─── AAMA DXF Layer Standards ───
 # AAMA-standard DXF layer names: key -> DXF layer name string
@@ -46,6 +36,7 @@ SEAM_ALLOWANCE = 1.0       # cm
 HEM_ALLOWANCE = 2.5        # cm
 OUTPUT_DIR = os.path.join(os.getcwd(), "output")
 DATABASE_PATH = os.path.join(os.getcwd(), "data", "templates.db")
+TEMPLATE_DIR = os.path.join(os.getcwd(), "templates")
 
 # ─── Ease Values ───
 EASE_BODICE = {"minimal": 2.0, "standard": 4.0, "loose": 6.0}
