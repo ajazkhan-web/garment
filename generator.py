@@ -1,847 +1,1260 @@
 """
-generator.py - 2D Garment Pattern Generator
-Generates AAMA/ASTM DXF files + SVG/PNG previews from measurement JSON.
+generator.py — Universal 2D Apparel Pattern Drafting Engine
+============================================================
+Generates professional CAD pattern pieces from body measurements using
+standard apparel drafting formulas.  Exports DXF / AAMA files compatible
+with Optitex, Gerber, and Lectra via ezdxf.
 
-Usage:
-    python generator.py --measurements measurements.json --garment-type tshirt_dress
+Garment types supported:
+    dress, kurti, bodice, skirt, shirt, sleeve
 
-Author: Built with Solene (Base44 Superagent) pattern drafting methodology
+Author: EJAJ KHAN
 """
+from __future__ import annotations
 
 import math
 import json
-import argparse
+import sqlite3
+import hashlib
 import os
-from typing import Dict, List, Tuple, Any
-
-# ============================================================
-# CONSTANTS & HELPERS
-# ============================================================
-
-IN_TO_CM = 2.54
-
-def cm(inches: float) -> float:
-    """Convert inches to centimeters."""
-    return round(inches * IN_TO_CM, 3)
-
-def catmull_rom_spline(p0, p1, p2, p3, points=12):
-    """Generate smooth curve points using Catmull-Rom interpolation."""
-    result = []
-    for i in range(points):
-        t = i / points
-        t2 = t * t
-        t3 = t2 * t
-        x = 0.5 * ((2 * p1[0]) +
-                   (-p0[0] + p2[0]) * t +
-                   (2*p0[0] - 5*p1[0] + 4*p2[0] - p3[0]) * t2 +
-                   (-p0[0] + 3*p1[0] - 3*p2[0] + p3[0]) * t3)
-        y = 0.5 * ((2 * p1[1]) +
-                   (-p0[1] + p2[1]) * t +
-                   (2*p0[1] - 5*p1[1] + 4*p2[1] - p3[1]) * t2 +
-                   (-p0[1] + 3*p1[1] - 3*p2[1] + p3[1]) * t3)
-        result.append((x, y))
-    return result
-
-def smooth_points(pts: List[Tuple[float, float]], smoothness=12) -> List[Tuple[float, float]]:
-    """Apply Catmull-Rom smoothing to a list of points, returning a smooth curve."""
-    if len(pts) < 3:
-        return pts
-    result = []
-    n = len(pts)
-    for i in range(n):
-        p0 = pts[(i - 1) % n]
-        p1 = pts[i]
-        p2 = pts[(i + 1) % n]
-        p3 = pts[(i + 2) % n]
-        result.extend(catmull_rom_spline(p0, p1, p2, p3, smoothness))
-    return result
-
-
-# ============================================================
-# PATTERN DRAFTING - EXACT WIDTH FORMULA
-# ============================================================
-
-def get_quarter_width(measurement_in: float) -> float:
-    """
-    EXACT WIDTH FORMULA: width = measurement / 4 (no ease added).
-    This is the user's critical rule - never add ease unless explicitly told.
-    """
-    return cm(measurement_in / 4.0)
-
-
-# ============================================================
-# GARMENT DRAFTING FUNCTIONS
-# ============================================================
-
-def draft_tshirt_dress(M: Dict[str, float]) -> Dict[str, Any]:
-    """
-    Draft a T-shirt dress pattern.
-    Expects: length, bust, waist, hip, bottom, shoulder, armhole, sleeve_length,
-             sleeve_opening, neck_width, fnd (front neck drop), bnd (back neck drop)
-    Returns: dict of piece_name -> list of (x, y) points in cm
-    """
-    bust_q = get_quarter_width(M["bust"])
-    waist_q = get_quarter_width(M["waist"])
-    hip_q = get_quarter_width(M["hip"])
-    bottom_q = get_quarter_width(M["bottom"])
-    half_shoulder = cm(M["shoulder"] / 2)
-    half_neck = cm(M["neck_width"] / 2)
-    armhole_depth = cm(M["armhole"])
-    length = cm(M["length"])
-    fnd = cm(M["fnd"])
-    bnd = cm(M["bnd"])
-
-    # --- BACK (on fold) ---
-    back_pts = [
-        (0, 0),                                    # CB neck top
-        (half_neck * 0.5, bnd * 0.15),             # neck-shoulder curve start
-        (half_shoulder, cm(0.6)),                  # shoulder tip
-        (bust_q, armhole_depth),                   # underarm
-        (waist_q, armhole_depth + cm(6)),          # waist point
-        (hip_q, armhole_depth + cm(9)),             # hip point
-        (bottom_q, length),                        # hem side
-        (0, length),                               # CB hem
-        (0, bnd),                                  # CB neck point
-    ]
-
-    # --- FRONT (on fold) ---
-    front_pts = [
-        (0, 0),                                    # CF neck top
-        (half_neck * 0.5, fnd * 0.15),             # neck-shoulder curve start
-        (half_shoulder, cm(0.6)),                  # shoulder tip
-        (bust_q, armhole_depth),                   # underarm (front armhole curves more at bottom)
-        (waist_q, armhole_depth + cm(6)),          # waist point
-        (hip_q, armhole_depth + cm(9)),             # hip point
-        (bottom_q, length),                        # hem side
-        (0, length),                               # CF hem
-        (0, fnd),                                  # CF neck point
-    ]
-
-    # --- SLEEVE (HJA method) ---
-    armhole_circumference = cm(M["armhole"]) * 2 * 0.9  # approx front+back armhole
-    cap_height = round(armhole_circumference / 3 + cm(0.4), 3)
-    bicep_half = cm(M.get("bicep", M["sleeve_opening"] * 1.3) / 2)
-    sleeve_length = cm(M["sleeve_length"])
-    cuff_half = cm(M["sleeve_opening"] / 2)
-
-    sleeve_pts = [
-        (bicep_half, 0),                           # cap center (shoulder match)
-        (bicep_half * 1.6, cap_height * 0.55),     # front cap mid (curvier)
-        (bicep_half * 2, cap_height),              # front bicep
-        (bicep_half * 2 - (bicep_half - cuff_half), sleeve_length),  # front cuff
-        (bicep_half - cuff_half, sleeve_length),    # back cuff
-        (0, cap_height),                           # back bicep
-        (bicep_half * 0.5, cap_height * 0.75),     # back cap mid (flatter)
-    ]
-
-    # --- NECK BAND ---
-    neck_perimeter = cm(M["neck_width"] + M["fnd"] + M["bnd"] + 4)  # approximate
-    neckband_pts = [
-        (0, 0), (neck_perimeter, 0),
-        (neck_perimeter, cm(1.5)), (0, cm(1.5))
-    ]
-
-    return {
-        "BACK": {"points": back_pts, "on_fold": True, "cut": 1,
-                 "label": f"BACK bust/4={bust_q}cm, BND={bnd}cm"},
-        "FRONT": {"points": front_pts, "on_fold": True, "cut": 1,
-                  "label": f"FRONT bust/4={bust_q}cm, FND={fnd}cm"},
-        "SLEEVE": {"points": sleeve_pts, "on_fold": False, "cut": 2,
-                   "label": f"SLEEVE cap={cap_height}cm, bicep={bicep_half*2}cm"},
-        "NECK_BAND": {"points": neckband_pts, "on_fold": False, "cut": 1,
-                      "label": "NECK BAND"},
-    }
-
-
-def draft_shirt(M: Dict[str, float]) -> Dict[str, Any]:
-    """
-    Draft a basic shirt pattern (with yoke, collar, cuff, placket).
-    Expects: length, bust, waist, hip, shoulder, armhole, sleeve_length,
-             sleeve_opening, neck_width, fnd, bnd, yoke_height, collar_height, cuff_height
-    """
-    bust_q = get_quarter_width(M["bust"])
-    waist_q = get_quarter_width(M.get("waist", M["bust"]))
-    hip_q = get_quarter_width(M.get("hip", M["bust"]))
-    bottom_q = get_quarter_width(M.get("bottom", M["bust"]))
-    half_shoulder = cm(M["shoulder"] / 2)
-    half_neck = cm(M["neck_width"] / 2)
-    armhole_depth = cm(M["armhole"])
-    length = cm(M["length"])
-    fnd = cm(M["fnd"])
-    bnd = cm(M["bnd"])
-    yoke_h = cm(M.get("yoke_height", 3))
-    collar_h = cm(M.get("collar_height", 3.5))
-    cuff_h = cm(M.get("cuff_height", 2.5))
-    placket_w = cm(M.get("placket_width", 1.5))
-
-    # --- BACK (on fold) ---
-    back_pts = [
-        (0, 0), (half_neck * 0.5, bnd * 0.15),
-        (half_shoulder, cm(0.6)), (bust_q, armhole_depth),
-        (waist_q, armhole_depth + cm(6)), (hip_q, armhole_depth + cm(9)),
-        (bottom_q, length), (0, length), (0, bnd),
-    ]
-
-    # --- FRONT (with placket extension) ---
-    front_pts = [
-        (0, fnd), (half_neck * 0.5, fnd * 0.15),
-        (half_shoulder, cm(0.5)), (bust_q, armhole_depth),
-        (waist_q, armhole_depth + cm(6)), (hip_q, armhole_depth + cm(9)),
-        (bottom_q, length), (placket_w, length),
-        (placket_w, 0), (0, fnd),
-    ]
-
-    # --- YOKE ---
-    yoke_pts = [
-        (0, 0), (half_shoulder + cm(0.5), 0),
-        (half_shoulder + cm(0.5), yoke_h),
-        (0, yoke_h),
-    ]
-
-    # --- SLEEVE ---
-    cap_height = round(cm(M["armhole"]) / 3 + cm(0.5), 3)
-    bicep_half = cm(M.get("bicep", M["sleeve_opening"] * 1.5) / 2)
-    sleeve_length = cm(M["sleeve_length"])
-    cuff_half = cm(M["sleeve_opening"] / 2)
-
-    sleeve_pts = [
-        (bicep_half, 0), (bicep_half * 1.6, cap_height * 0.55),
-        (bicep_half * 2, cap_height),
-        (bicep_half * 2 - (bicep_half - cuff_half), sleeve_length),
-        (bicep_half - cuff_half, sleeve_length),
-        (0, cap_height), (bicep_half * 0.5, cap_height * 0.75),
-    ]
-
-    # --- COLLAR ---
-    collar_pts = [
-        (0, 0), (cm(M["neck_width"] + 3), 0),
-        (cm(M["neck_width"] + 3), collar_h), (0, collar_h),
-    ]
-
-    # --- CUFF ---
-    cuff_pts = [
-        (0, 0), (cm(M["sleeve_opening"] + 2), 0),
-        (cm(M["sleeve_opening"] + 2), cuff_h), (0, cuff_h),
-    ]
-
-    return {
-        "BACK": {"points": back_pts, "on_fold": True, "cut": 1,
-                 "label": f"BACK bust/4={bust_q}cm"},
-        "FRONT": {"points": front_pts, "on_fold": False, "cut": 1,
-                  "label": f"FRONT +placket {placket_w}cm"},
-        "YOKE": {"points": yoke_pts, "on_fold": True, "cut": 2,
-                 "label": "YOKE (back)"},
-        "SLEEVE": {"points": sleeve_pts, "on_fold": False, "cut": 2,
-                   "label": f"SLEEVE cap={cap_height}cm"},
-        "COLLAR": {"points": collar_pts, "on_fold": True, "cut": 2,
-                   "label": "COLLAR"},
-        "CUFF": {"points": cuff_pts, "on_fold": False, "cut": 2,
-                 "label": "CUFF"},
-    }
-
-
-def draft_jacket(M: Dict[str, float]) -> Dict[str, Any]:
-    """
-    Draft a bomber/track jacket pattern.
-    Expects: length, chest, bottom_relax, shoulder, neck_width, armhole,
-             bicep, sleeve_length, sleeve_opening, rib_height, neck_drop_front, neck_drop_back
-    """
-    chest_q = get_quarter_width(M["chest"])
-    bottom_q = cm(M.get("bottom_relax", M["chest"]) / 2)  # bottom rib = half circumference per piece
-    half_shoulder = cm(M["shoulder"] / 2)
-    half_neck = cm(M["neck_width"] / 2)
-    armhole_depth = cm(M["armhole"])
-    length = cm(M["length"])
-    fnd = cm(M.get("neck_drop_front", 0.75))
-    bnd = cm(M.get("neck_drop_back", 1.0))
-    rib_h = cm(M.get("rib_height", 2.5))
-
-    # --- BACK (on fold) ---
-    back_pts = [
-        (0, 0), (half_neck * 0.5, bnd * 0.15),
-        (half_shoulder, cm(0.6)), (chest_q, armhole_depth),
-        (chest_q, length), (0, length), (0, bnd),
-    ]
-
-    # --- FRONT (on fold for pullover, or split for full zip) ---
-    full_zip = M.get("full_zip", False)
-    if full_zip:
-        front_pts = [
-            (0, fnd), (half_neck * 0.5, fnd * 0.15),
-            (half_shoulder, cm(0.5)), (chest_q, armhole_depth),
-            (chest_q, length), (0, length),
-        ]
-    else:
-        front_pts = [
-            (0, 0), (half_neck * 0.5, fnd * 0.15),
-            (half_shoulder, cm(0.5)), (chest_q, armhole_depth),
-            (chest_q, length), (0, length), (0, fnd),
-        ]
-
-    # --- SLEEVE ---
-    cap_height = round(cm(M["armhole"]) / 3 + cm(1.25), 3)  # jacket ease = 1.25"
-    bicep_half = cm(M["bicep"] / 2)
-    sleeve_length = cm(M["sleeve_length"])
-    cuff_half = cm(M["sleeve_opening"] / 2)
-
-    sleeve_pts = [
-        (bicep_half, 0), (bicep_half * 1.6, cap_height * 0.55),
-        (bicep_half * 2, cap_height),
-        (bicep_half * 2 - (bicep_half - cuff_half), sleeve_length),
-        (bicep_half - cuff_half, sleeve_length),
-        (0, cap_height), (bicep_half * 0.5, cap_height * 0.75),
-    ]
-
-    # --- NECK RIB ---
-    neck_rib_pts = [
-        (0, 0), (cm(M["neck_width"] + 2), 0),
-        (cm(M["neck_width"] + 2), rib_h), (0, rib_h),
-    ]
-
-    # --- BOTTOM RIB (half circumference) ---
-    bottom_rib_pts = [
-        (0, 0), (bottom_q, 0),
-        (bottom_q, rib_h), (0, rib_h),
-    ]
-
-    # --- SLEEVE RIB ---
-    sleeve_rib_pts = [
-        (0, 0), (cm(M["sleeve_opening"] + 1), 0),
-        (cm(M["sleeve_opening"] + 1), rib_h), (0, rib_h),
-    ]
-
-    pieces = {
-        "BACK": {"points": back_pts, "on_fold": True, "cut": 1,
-                 "label": f"BACK chest/4={chest_q}cm"},
-        "FRONT": {"points": front_pts, "on_fold": not full_zip, "cut": 1,
-                  "label": f"FRONT chest/4={chest_q}cm"},
-        "SLEEVE": {"points": sleeve_pts, "on_fold": False, "cut": 2,
-                   "label": f"SLEEVE cap={cap_height}cm"},
-        "NECK_RIB": {"points": neck_rib_pts, "on_fold": False, "cut": 1,
-                     "label": "NECK RIB"},
-        "BOTTOM_RIB": {"points": bottom_rib_pts, "on_fold": False, "cut": 2,
-                       "label": f"BOTTOM RIB {bottom_q}cm"},
-        "SLEEVE_RIB": {"points": sleeve_rib_pts, "on_fold": False, "cut": 2,
-                       "label": "SLEEVE RIB"},
-    }
-
-    # Add side pockets if specified
-    if M.get("side_pocket_opening"):
-        pocket_w = cm(M["side_pocket_opening"])
-        pocket_pts = [
-            (0, 0), (pocket_w, 0), (pocket_w, cm(8)),
-            (0, cm(8)),
-        ]
-        pieces["SIDE_POCKET"] = {"points": pocket_pts, "on_fold": False, "cut": 4,
-                                  "label": "SIDE POCKET"}
-
-    return pieces
-
-
-def draft_pants(M: Dict[str, float]) -> Dict[str, Any]:
-    """
-    Draft wide-leg pants / palazzo pattern.
-    Expects: length, waist, hip, front_rise, back_rise, bottom_width, side_pocket_opening
-    """
-    waist_q = get_quarter_width(M["waist"])
-    hip_q = get_quarter_width(M["hip"])
-    bottom_q = cm(M["bottom_width"] / 4)
-    front_rise = cm(M["front_rise"])
-    back_rise = cm(M["back_rise"])
-    length = cm(M["length"])
-    hip_drop = cm(M.get("hip_drop", 8))  # distance from waist to hip line
-
-    # Crotch extensions (professional trouser drafting)
-    front_crotch_ext = hip_q / 14 * 2.54  # hip/14
-    back_crotch_ext = front_crotch_ext + cm(3)  # back needs more room
-
-    # --- FRONT PANT ---
-    front_pts = [
-        (0, 0),                                    # CF waist
-        (waist_q, 0),                               # side waist
-        (hip_q, hip_drop),                          # side hip
-        (bottom_q, length),                         # side hem
-        (0, length),                                # CF hem
-        (0, front_rise),                            # CF crotch point
-        (-front_crotch_ext, front_rise * 0.7),     # crotch extension
-        (-front_crotch_ext * 0.5, 0),              # crotch to waist
-    ]
-
-    # --- BACK PANT ---
-    back_pts = [
-        (0, 0),                                     # CB waist
-        (waist_q, 0),                                # side waist
-        (hip_q, hip_drop),                           # side hip
-        (bottom_q, length),                          # side hem
-        (0, length),                                 # CB hem
-        (0, back_rise),                              # CB crotch point
-        (-back_crotch_ext, back_rise * 0.7),        # crotch extension (more than front)
-        (-back_crotch_ext * 0.5, 0),               # crotch to waist
-    ]
-
-    pieces = {
-        "FRONT_PANT": {"points": front_pts, "on_fold": False, "cut": 2,
-                        "label": f"FRONT rise={front_rise}cm"},
-        "BACK_PANT": {"points": back_pts, "on_fold": False, "cut": 2,
-                      "label": f"BACK rise={back_rise}cm"},
-    }
-
-    # Add waistband
-    waistband_pts = [(0, 0), (waist_q, 0), (waist_q, cm(1.5)), (0, cm(1.5))]
-    pieces["WAISTBAND"] = {"points": waistband_pts, "on_fold": False, "cut": 1,
-                           "label": "WAISTBAND"}
-
-    # Add pockets if specified
-    if M.get("side_pocket_opening"):
-        pocket_w = cm(M["side_pocket_opening"])
-        pocket_pts = [(0, 0), (pocket_w, 0), (pocket_w, cm(10)), (0, cm(10))]
-        pieces["SIDE_POCKET"] = {"points": pocket_pts, "on_fold": False, "cut": 4,
-                                  "label": "SIDE POCKET"}
-
-    return pieces
-
-
-# ============================================================
-# DXF GENERATION (AAMA/ASTM, native cm)
-# ============================================================
-
-def generate_dxf(pieces: Dict[str, Any], output_path: str, title: str = "PATTERN"):
-    """
-    Generate AAMA/ASTM compliant DXF file in native centimeters.
-    Uses R2000 format, numbered layers, BLOCK structure per piece.
-    """
-    try:
-        import ezdxf
-    except ImportError:
-        print("ERROR: ezdxf not installed. Run: pip install ezdxf")
-        return False
-
-    doc = ezdxf.new("R2000")
-    doc.header["$INSUNITS"] = 5       # 5 = centimeters (CRITICAL for Optitex)
-    doc.header["$MEASUREMENT"] = 1   # Metric
-
-    # Create numbered layers (AAMA/ASTM standard)
-    for i in range(1, 16):
-        try:
-            doc.layers.add(str(i), color=i)
-        except:
-            pass
-
-    blocks = doc.blocks
-    msp = doc.modelspace()
-
-    markings = pieces.get("_markings", {})
-    offset_x = 0
-    offsets_map = {}
-    for name, piece_data in pieces.items():
-        if name == "_markings":
-            continue
-        pts = piece_data["points"]
-        label = piece_data.get("label", name)
-        cut_qty = piece_data.get("cut", 1)
-        on_fold = piece_data.get("on_fold", False)
-
-        # Create BLOCK for this piece
-        if name in blocks:
-            blocks.delete_block(name)
-        blk = blocks.new(name=name)
-
-        # Offset points
-        pts_off = [(x + offset_x, y) for x, y in pts]
-
-        # Piece outline (layer 1 = boundary)
-        blk.add_lwpolyline(pts_off, dxfattribs={"layer": "1"}, close=True)
-
-        # Grain line (layer 7, vertical center)
-        cx = sum(p[0] for p in pts_off) / len(pts_off)
-        ys = [p[1] for p in pts_off]
-        blk.add_line((cx, min(ys) + 0.8), (cx, max(ys) - 0.8),
-                     dxfattribs={"layer": "7"})
-
-        # Fold line if on fold (layer 6)
-        if on_fold:
-            blk.add_line((pts_off[0][0], min(ys)), (pts_off[0][0], max(ys)),
-                         dxfattribs={"layer": "6"})
-
-        # Labels (layer 15)
-        blk.add_text(label, dxfattribs={"layer": "15", "height": 0.5}).set_placement(
-            (pts_off[0][0] + 0.3, pts_off[0][1] + 0.3))
-        fold_text = "ON FOLD" if on_fold else "NOT ON FOLD"
-        blk.add_text(f"CUT {cut_qty} {fold_text}",
-                     dxfattribs={"layer": "15", "height": 0.45}).set_placement(
-            (pts_off[0][0] + 0.3, pts_off[0][1] - 0.5))
-
-        # Draw darts (BACK_SKIRT) and pleats (SKIRT_LEFT) and buttons (SKIRT_RIGHT)
-        if name == "BACK_SKIRT" and markings.get("dart_positions"):
-            for dp in markings["dart_positions"]:
-                dx = dp + offset_x
-                blk.add_line((dx, 0.5), (dx, 0.5 + markings["dart_length"]), dxfattribs={"layer": "4"})
-            blk.add_text(f"{len(markings['dart_positions'])} WAIST DARTS", dxfattribs={"layer": "4", "height": 0.45}).set_placement((offset_x + 1, 2))
-        if name == "SKIRT_LEFT" and markings.get("pleat_positions"):
-            max_x_local = max(x for x, y in pts)
-            for pp in markings["pleat_positions"]:
-                blk.add_line((0.5 + offset_x, pp), (max_x_local + offset_x - 0.5, pp), dxfattribs={"layer": "5"})
-            blk.add_text(f"{len(markings['pleat_positions'])} PLEATS x {markings['pleat_depth']}cm", dxfattribs={"layer": "5", "height": 0.45}).set_placement((offset_x + 0.5, markings["pleat_positions"][0] - 1.5))
-        if name == "SKIRT_RIGHT" and markings.get("num_buttons"):
-            op = pts_off[4]
-            blk.add_circle((op[0], op[1] - 1), 0.5, dxfattribs={"layer": "6"})
-            for i in range(markings["num_buttons"]):
-                t = (i + 0.5) / markings["num_buttons"]
-                bx = pts_off[0][0] + (op[0] - pts_off[0][0]) * t
-                by = pts_off[0][1] + (op[1] - pts_off[0][1]) * t * 0.3
-                blk.add_circle((bx, by), 0.25, dxfattribs={"layer": "2"})
-
-        # Add block reference to modelspace
-        msp.add_blockref(name, insert=(0, 0), dxfattribs={"layer": "0"})
-
-        # Advance offset
-        xs = [p[0] for p in pts]
-        offset_x += (max(xs) - min(xs)) + 4
-
-    # Title text
-    msp.add_text(f"{title} - NATIVE CM - INSUNITS=5",
-                 dxfattribs={"layer": "15", "height": 1.0}).set_placement((0, -6))
-
-    doc.saveas(output_path)
-    return True
-
-
-# ============================================================
-# SVG / PNG PREVIEW GENERATION
-# ============================================================
-
-def generate_svg(pieces: Dict[str, Any], output_path: str, title: str = "Pattern"):
-    """Generate an SVG preview of all pattern pieces."""
-    colors = ["#5a4d3a", "#4a5d6a", "#6a4d5a", "#4d6a4d", "#5a5a4d",
-              "#3a5d7a", "#7a4d3a", "#4d7a6a", "#6a6a4d", "#5d3a7a"]
-
-    # Calculate layout
-    real_pieces = {k: v for k, v in pieces.items() if k != "_markings"}
-    offsets = {}
-    cur = 0
-    for name, pd in real_pieces.items():
-        pts = pd["points"]
-        xs = [p[0] for p in pts]
-        offsets[name] = cur
-        cur += (max(xs) - min(xs)) + 4
-    total_w = cur
-
-    all_shifted = [(x + offsets[name], y)
-                   for name, pd in real_pieces.items()
-                   for x, y in pd["points"]]
-    min_x = min(x for x, y in all_shifted) - 2
-    max_x = total_w + 2
-    min_y = min(y for x, y in all_shifted) - 2
-    max_y = max(y for x, y in all_shifted) + 2
-
-    scale = 3.2
-    margin = 70
-    w = int((max_x - min_x) * scale + margin * 2)
-    h = int((max_y - min_y) * scale + margin * 2 + 40)
-
-    def tx(x):
-        return (x - min_x) * scale + margin
-
-    def ty(y):
-        return (max_y - y) * scale + margin + 40
-
-    lines = []
-    lines.append(f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="0 0 {w} {h}">')
-    lines.append(f'<rect width="{w}" height="{h}" fill="#faf7f2"/>')
-    lines.append(f'<text x="{margin}" y="32" font-family="Arial" font-size="18" font-weight="bold" fill="#2d2d2d">{title} - {len(real_pieces)} Pieces</text>')
-
-    for i, (name, pd) in enumerate(real_pieces.items()):
-        pts = pd["points"]
-        off = offsets[name]
-        color = colors[i % len(colors)]
-        shifted = [(x + off, y) for x, y in pts]
-
-        path_str = " ".join(f"{tx(x):.1f},{ty(y):.1f}" for x, y in shifted)
-        lines.append(f'<polygon points="{path_str}" fill="{color}33" stroke="{color}" stroke-width="2"/>')
-
-        w_cm = max(x for x, y in pts) - min(x for x, y in pts)
-        h_cm = max(y for x, y in pts) - min(y for x, y in pts)
-        lines.append(f'<text x="{tx(shifted[0][0]):.1f}" y="{ty(shifted[0][1]) - 8:.1f}" font-family="Arial" font-size="11" font-weight="bold" fill="{color}">{name.replace("_", " ")}</text>')
-        lines.append(f'<text x="{tx(shifted[0][0]):.1f}" y="{ty(shifted[0][1]) + 10:.1f}" font-family="Arial" font-size="9" fill="{color}">{w_cm:.1f}cm x {h_cm:.1f}cm ({w_cm/2.54:.1f}in x {h_cm/2.54:.1f}in)</text>')
-
-    lines.append(f'<text x="{margin}" y="{h - 15}" font-family="Arial" font-size="10" fill="#666">All widths EXACT per /4 rule. DXF in native cm for Optitex 15.</text>')
-    lines.append('</svg>')
-
-    with open(output_path, "w") as f:
-        f.write("\n".join(lines))
-
-    # Convert to PNG if cairosvg is available
-    png_path = output_path.replace(".svg", ".png")
-    try:
-        import cairosvg
-        cairosvg.svg2png(url=output_path, write_to=png_path, scale=1.5)
-        return png_path
-    except ImportError:
-        print("WARNING: cairosvg not installed. SVG generated but no PNG. Run: pip install cairosvg")
-        return output_path
-
-
-
-def draft_wrap_blazer_dress(M: Dict[str, float]) -> Dict[str, Any]:
-    """
-    Draft a tailored wrap blazer dress with shawl collar (Himanshi-style).
-    Handles: waist darts, side pleats, shawl collar overlap, waistband, asymmetric hem.
-
-    Expects: length, bust, waist, hip, bottom, shoulder, back_neck_width,
-             front_neck_drop_to_cross, back_neck_drop, cb_collar_height,
-             armhole, bicep, sleeve_length, sleeve_opening,
-             waistband_top_below_ah, waistband_height,
-    Optional: num_left_pleats (default 4), pleat_depth (default 1),
-              pleat_to_pleat_dist (default 1.25), pleat_dist_from_waist (default 1.25),
-              overlap_side_facing_width (default 2), num_buttons (default 5),
-              overlap_gap_from_left_side (default 6), overlap_extra_bottom_point (default 1.5),
-              above_waist_dart_length (default 4.5), num_waist_darts (default 3)
-    """
-    bust_q = get_quarter_width(M["bust"])
-    waist_q = get_quarter_width(M["waist"])
-    hip_q = get_quarter_width(M.get("hip", M["waist"] * 1.25))
-    bottom_q = get_quarter_width(M.get("bottom", M.get("hip", M["waist"] * 1.3)))
-    half_shoulder = cm(M["shoulder"] / 2)
-    half_back_neck = cm(M.get("back_neck_width", M["shoulder"] * 0.5) / 2)
-    bicep_half = cm(M.get("bicep", M["sleeve_opening"] * 1.5) / 2)
-
-    front_neck_drop_to_cross = cm(M.get("front_neck_drop_to_cross", 7))
-    back_neck_drop = cm(M.get("back_neck_drop", 0.5))
-    cb_collar_height = cm(M.get("cb_collar_height", 2.5))
-    armhole_straight = cm(M["armhole"])
-    sleeve_length = cm(M["sleeve_length"])
-    sleeve_opening = cm(M["sleeve_opening"])
-
-    waistband_top_below_ah = cm(M.get("waistband_top_below_ah", 6.5))
-    waistband_height = cm(M.get("waistband_height", 1))
-
-    # Lengths derived directly from spec (no assumptions if given)
-    bodice_len = armhole_straight + waistband_top_below_ah
-    total_length = cm(M["length"])
-    skirt_len = total_length - bodice_len - waistband_height
-
-    # Pleat/dart/overlap details
-    num_left_pleats = int(M.get("num_left_pleats", 4))
-    pleat_depth = cm(M.get("pleat_depth", 1))
-    pleat_to_pleat_dist = cm(M.get("pleat_to_pleat_dist", 1.25))
-    pleat_dist_from_waist = cm(M.get("pleat_dist_from_waist", 1.25))
-    overlap_ext = cm(M.get("overlap_side_facing_width", 2))
-    num_buttons = int(M.get("num_buttons", 5))
-    overlap_gap = cm(M.get("overlap_gap_from_left_side", 6))
-    overlap_extra_bottom = cm(M.get("overlap_extra_bottom_point", 1.5))
-    dart_length = cm(M.get("above_waist_dart_length", 4.5))
-    num_waist_darts = int(M.get("num_waist_darts", 3))
-
-    # --- BACK BODICE (on fold) ---
-    back_bodice_pts = [
-        (0, 0), (half_back_neck, back_neck_drop * 0.3),
-        (half_shoulder, cm(0.6)), (bust_q, armhole_straight),
-        (waist_q, bodice_len), (0, bodice_len), (0, back_neck_drop),
-    ]
-
-    # --- BACK SKIRT (on fold, darts) ---
-    back_skirt_pts = [
-        (0, 0), (waist_q, 0), (hip_q, cm(9.0)), (bottom_q, skirt_len), (0, skirt_len),
-    ]
-    dart_positions = [waist_q * 0.3, waist_q * 0.55, waist_q * 0.8][:num_waist_darts]
-
-    # --- FRONT LEFT BODICE (under layer, standard) ---
-    front_left_pts = [
-        (0, front_neck_drop_to_cross), (bust_q * 0.3, back_neck_drop * 0.5),
-        (half_shoulder, cm(0.5)), (bust_q, armhole_straight),
-        (waist_q, bodice_len), (0, bodice_len),
-    ]
-
-    # --- FRONT RIGHT BODICE (wrap over-layer, +overlap) ---
-    front_right_pts = [
-        (0, front_neck_drop_to_cross), (bust_q * 0.3, back_neck_drop * 0.5),
-        (half_shoulder, cm(0.5)), (bust_q + overlap_ext * 0.5, armhole_straight),
-        (waist_q + overlap_ext, bodice_len), (overlap_ext, bodice_len),
-    ]
-
-    # --- SHAWL COLLAR (cut 1 on fold) ---
-    shawl_collar_pts = [
-        (0, 0), (half_back_neck * 0.8, cm(0.5)),
-        (half_shoulder * 0.9, cb_collar_height * 0.6),
-        (half_shoulder * 1.3, front_neck_drop_to_cross * 0.85),
-        (half_shoulder * 0.6, front_neck_drop_to_cross),
-        (0, cb_collar_height),
-    ]
-
-    # --- WAISTBAND (cut 2) ---
-    waistband_pts = [(0, 0), (waist_q, 0), (waist_q, waistband_height), (0, waistband_height)]
-
-    # --- SKIRT LEFT (pleats) ---
-    skirt_left_pts = [(0, 0), (waist_q, 0), (hip_q, cm(9.0)), (bottom_q, skirt_len), (0, skirt_len)]
-    pleat_positions = [pleat_dist_from_waist + i * pleat_to_pleat_dist for i in range(num_left_pleats)]
-
-    # --- SKIRT RIGHT (overlap point) ---
-    skirt_right_pts = [
-        (0, 0), (waist_q, 0), (hip_q, cm(9.0)),
-        (bottom_q, skirt_len - overlap_extra_bottom),
-        (overlap_gap, skirt_len), (0, skirt_len),
-    ]
-
-    # --- SLEEVE (fitted, HJA method) ---
-    cap_height = round(armhole_straight / 3 + cm(0.5), 3)
-    sleeve_pts = [
-        (0, cap_height), (bicep_half * 0.5, cap_height * 0.5), (bicep_half, 0),
-        (bicep_half * 1.5, cap_height * 0.6), (bicep_half * 2, cap_height),
-        (bicep_half * 2 - (bicep_half - sleeve_opening / 2), sleeve_length),
-        (bicep_half - sleeve_opening / 2, sleeve_length),
-    ]
-
-    pieces = {
-        "BACK_BODICE": {"points": back_bodice_pts, "on_fold": True, "cut": 1,
-                        "label": f"BACK BODICE bust/4={bust_q}cm EXACT"},
-        "BACK_SKIRT": {"points": back_skirt_pts, "on_fold": True, "cut": 1,
-                       "label": f"BACK SKIRT +{num_waist_darts} waist darts ({dart_length}cm)"},
-        "FRONT_LEFT_BODICE": {"points": front_left_pts, "on_fold": False, "cut": 1,
-                              "label": "FRONT LEFT (under layer)"},
-        "FRONT_RIGHT_BODICE": {"points": front_right_pts, "on_fold": False, "cut": 1,
-                               "label": f"FRONT RIGHT (wrap over-layer +{overlap_ext}cm)"},
-        "SHAWL_COLLAR": {"points": shawl_collar_pts, "on_fold": True, "cut": 1,
-                         "label": f"SHAWL COLLAR CB height={cb_collar_height}cm"},
-        "WAISTBAND": {"points": waistband_pts, "on_fold": False, "cut": 2,
-                     "label": f"WAISTBAND height={waistband_height}cm exact"},
-        "SKIRT_LEFT": {"points": skirt_left_pts, "on_fold": False, "cut": 1,
-                       "label": f"SKIRT LEFT +{num_left_pleats} pleats ({pleat_depth}cm depth)"},
-        "SKIRT_RIGHT": {"points": skirt_right_pts, "on_fold": False, "cut": 1,
-                        "label": f"SKIRT RIGHT +overlap point (gap {overlap_gap}cm)"},
-        "SLEEVE": {"points": sleeve_pts, "on_fold": False, "cut": 2,
-                  "label": f"SLEEVE fitted bicep/2={bicep_half}cm"},
-    }
-
-    # Store markings as metadata for DXF/preview generators to draw
-    pieces["_markings"] = {
-        "dart_positions": dart_positions, "dart_length": dart_length,
-        "pleat_positions": pleat_positions, "pleat_depth": pleat_depth,
-        "num_buttons": num_buttons,
-    }
-    return pieces
-
-
-# ============================================================
-# MAIN - DISPATCHER
-# ============================================================
-
-GARMENT_DRAFTERS = {
-    "tshirt_dress": draft_tshirt_dress,
-    "tshirt": draft_tshirt_dress,
-    "shirt": draft_shirt,
-    "jacket": draft_jacket,
-    "bomber": draft_jacket,
-    "pants": draft_pants,
-    "palazzo": draft_pants,
-    "wrap_blazer_dress": draft_wrap_blazer_dress,
-    "blazer_dress": draft_wrap_blazer_dress,
-    "wrap_dress": draft_wrap_blazer_dress,
-}
-
-def generate_pattern(measurements: Dict[str, float], garment_type: str,
-                     output_dir: str = "output", title: str = None) -> Dict[str, str]:
-    """
-    Main entry point: generate a complete pattern from measurements.
-    Returns dict with paths to generated files.
-    """
-    garment_type = garment_type.lower().strip()
-    if garment_type not in GARMENT_DRAFTERS:
-        raise ValueError(f"Unknown garment type: {garment_type}. Available: {list(GARMENT_DRAFTERS.keys())}")
-
-    if title is None:
-        title = garment_type.replace("_", " ").title() + " Pattern"
-
-    os.makedirs(output_dir, exist_ok=True)
-
-    # Draft pieces
-    drafter = GARMENT_DRAFTERS[garment_type]
-    pieces = drafter(measurements)
-
-    # Generate DXF
-    dxf_path = os.path.join(output_dir, f"{garment_type}_pattern.dxf")
-    dxf_ok = generate_dxf(pieces, dxf_path, title)
-
-    # Generate preview
-    svg_path = os.path.join(output_dir, f"{garment_type}_preview.svg")
-    png_path = generate_svg(pieces, svg_path, title)
-
-    # Save piece data
-    json_path = os.path.join(output_dir, f"{garment_type}_pieces.json")
-    serializable = {}
-    for name, pd in pieces.items():
-        if name == "_markings":
-            serializable[name] = pd
-            continue
-        serializable[name] = {
-            "points": pd["points"],
-            "on_fold": pd.get("on_fold", False),
-            "cut": pd.get("cut", 1),
-            "label": pd.get("label", name),
+from dataclasses import dataclass, field, asdict
+from typing import Optional
+from datetime import datetime
+
+import ezdxf
+from ezdxf.entities import DXFGraphic
+
+try:
+    import config
+except ImportError:  # standalone import fallback
+    class _C:
+        OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+        CACHE_DIR = os.path.join(os.getcwd(), "cache")
+        TEMPLATE_DIR = os.path.join(os.getcwd(), "templates")
+        OUTPUT_DIR = os.path.join(os.getcwd(), "output")
+        DATABASE_PATH = os.path.join(os.getcwd(), "data", "templates.db")
+        SEAM_ALLOWANCE = 1.0
+        HEM_ALLOWANCE = 2.5
+        AAMA_LAYERS = {
+            "CUT": "1", "SEAM": "5", "GRAIN": "7", "NOTCH": "8",
+            "INTERNAL": "3", "REFERENCE": "4", "ANNOTATION": "6", "MIRROR": "9",
         }
-    with open(json_path, "w") as f:
-        json.dump(serializable, f, indent=2)
+        EASE_BODICE = {"minimal": 2.0, "standard": 4.0, "loose": 6.0}
+        EASE_SKIRT = {"minimal": 2.0, "standard": 3.0, "loose": 5.0}
+    config = _C()
 
-    # Print summary
-    print(f"\n{'='*50}")
-    print(f"  {title}")
-    print(f"{'='*50}")
-    print(f"  Garment type: {garment_type}")
-    real_pieces_count = len({k:v for k,v in pieces.items() if k != "_markings"})
-    print(f"  Pieces: {real_pieces_count}")
-    for name, pd in pieces.items():
-        if name == "_markings":
-            continue
-        pts = pd["points"]
-        w = max(x for x, y in pts) - min(x for x, y in pts)
-        h = max(y for x, y in pts) - min(y for x, y in pts)
-        qty = pd.get("cut", 1)
-        print(f"    {name:16s}: {w:6.2f}cm x {h:6.2f}cm  ({w/2.54:5.2f}in x {h/2.54:5.2f}in)  cut {qty}")
-    print(f"{'='*50}")
-    print(f"  DXF: {dxf_path} ({'OK' if dxf_ok else 'FAILED'})")
-    print(f"  Preview: {png_path}")
-    print(f"  Pieces JSON: {json_path}")
-    print(f"{'='*50}")
+# ====================================================================
+# DATA STRUCTURES
+# ====================================================================
 
-    return {
-        "dxf": dxf_path if dxf_ok else None,
-        "preview": png_path,
-        "pieces_json": json_path,
-        "piece_count": len([k for k in pieces if k != "_markings"]),
-    }
+@dataclass
+class Measurements:
+    """Normalised body measurements in centimetres."""
+    bust: float = 0.0
+    waist: float = 0.0
+    hip: float = 0.0
+    shoulder_width: float = 0.0       # across-shoulder
+    shoulder_length: float = 0.0      # neck-to-shoulder-tip
+    back_length: float = 0.0          # nape to waist (CB)
+    front_length: float = 0.0         # shoulder to waist (CF)
+    armhole_depth: float = 0.0        # scye depth
+    neck_width: float = 0.0
+    neck_depth_front: float = 0.0
+    neck_depth_back: float = 0.0
+    sleeve_length: float = 0.0
+    bicep: float = 0.0
+    wrist: float = 0.0
+    skirt_length: float = 0.0
+    dress_length: float = 0.0
+    shoulder_to_bust: float = 0.0
+    bust_span: float = 0.0            # distance between bust points (apex)
+    waist_to_hip: float = 20.0        # typical 18-22cm
+    apex_to_apex: float = 0.0
+    shoulder_slope: float = 4.0       # cm drop from neck to shoulder tip
+    dart_intake_bust: float = 0.0
+    dart_intake_waist_front: float = 0.0
+    dart_intake_waist_back: float = 0.0
+    ease: str = "standard"            # minimal / standard / loose
 
+    def validate(self) -> bool:
+        required = ["bust", "waist", "hip"]
+        return all(getattr(self, k, 0) > 0 for k in required)
+
+    def missing_keys(self) -> list[str]:
+        return [k for k in
+                ("bust", "waist", "hip", "shoulder_width", "back_length")
+                if getattr(self, k, 0) <= 0]
+
+
+@dataclass
+class Point:
+    x: float
+    y: float
+
+    def to_tuple(self) -> tuple[float, float]:
+        return (self.x, self.y)
+
+    def __add__(self, other: "Point") -> "Point":
+        return Point(self.x + other.x, self.y + other.y)
+
+    def __sub__(self, other: "Point") -> "Point":
+        return Point(self.x - other.x, self.y - other.y)
+
+
+@dataclass
+class PatternPiece:
+    """A single pattern piece (e.g. front bodice, back sleeve)."""
+    name: str
+    piece_type: str            # "front" | "back" | "sleeve" | "collar" | "facing" | "other"
+    outline: list[Point] = field(default_factory=list)      # main cutting line
+    seam_line: list[Point] = field(default_factory=list)     # stitching line (inside SA)
+    darts: list[dict] = field(default_factory=list)          # each: {start, end, apex}
+    notches: list[Point] = field(default_factory=list)
+    grainline: Optional[dict] = None                          # {start, end, direction}
+    internal_lines: list[dict] = field(default_factory=list)
+    annotations: list[dict] = field(default_factory=list)     # {pos, text}
+    mirror_axis: Optional[dict] = None                        # {start, end}
+    meta: dict = field(default_factory=dict)
+
+
+# ====================================================================
+# MATH HELPERS
+# ====================================================================
+
+def _dist(p1: Point, p2: Point) -> float:
+    return math.hypot(p2.x - p1.x, p2.y - p1.y)
+
+def _midpoint(p1: Point, p2: Point) -> Point:
+    return Point((p1.x + p2.x) / 2, (p1.y + p2.y) / 2)
+
+def _polar(origin: Point, angle_deg: float, length: float) -> Point:
+    r = math.radians(angle_deg)
+    return Point(
+        origin.x + length * math.cos(r),
+        origin.y + length * math.sin(r),
+    )
+
+def _angle(p1: Point, p2: Point) -> float:
+    return math.degrees(math.atan2(p2.y - p1.y, p2.x - p1.x))
+
+def _perp_point(p1: Point, p2: Point, offset: float, from_t: float = 0.5) -> Point:
+    """Return a point offset perpendicular to segment p1-p2 at parametric t."""
+    mid = Point(p1.x + (p2.x - p1.x) * from_t, p1.y + (p2.y - p1.y) * from_t)
+    a = _angle(p1, p2) + 90
+    return _polar(mid, a, offset)
+
+def _offset_polyline(points: list[Point], distance: float) -> list[Point]:
+    """Offset a polyline outward by *distance* (simple miter join)."""
+    if len(points) < 2:
+        return list(points)
+    result: list[Point] = []
+    n = len(points)
+    for i in range(n):
+        p_prev = points[i - 1] if i > 0 else points[0]
+        p_curr = points[i]
+        p_next = points[i + 1] if i < n - 1 else points[-1]
+
+        # direction of incoming and outgoing edges
+        a_in = _angle(p_prev, p_curr) if i > 0 else _angle(p_curr, p_next)
+        a_out = _angle(p_curr, p_next) if i < n - 1 else a_in
+        a_avg = (a_in + a_out) / 2
+
+        perp = a_avg + 90
+        result.append(_polar(p_curr, perp, distance))
+    return result
+
+
+# ====================================================================
+# DRAFTING ENGINE — Block Computations
+# ====================================================================
+
+class DraftingEngine:
+    """Computes pattern geometry from Measurements using standard
+    flat-pattern drafting formulas (Aldrich / Winifred Aldrich method)."""
+
+    def __init__(self, m: Measurements, ease: str = "standard"):
+        self.m = m
+        self.ease_value = config.EASE_BODICE.get(ease, 4.0)
+        self.skirt_ease = config.EASE_SKIRT.get(ease, 3.0)
+        self.sa = config.SEAM_ALLOWANCE
+        self.hem = config.HEM_ALLOWANCE
+
+        # Derived values
+        self._compute_derived()
+
+    def _compute_derived(self):
+        m = self.m
+        # Half-measurements (drafting uses quarters & halves)
+        self.half_bust = m.bust / 2
+        self.quarter_bust = (m.bust + self.ease_value) / 4
+        self.quarter_waist = (m.waist + 1) / 4      # minimal waist ease
+        self.quarter_hip = (m.hip + self.skirt_ease) / 4
+
+        # Auto armhole if not provided
+        if m.armhole_depth <= 0:
+            self.armhole_depth = m.bust / 4 + 2.0
+        else:
+            self.armhole_depth = m.armhole_depth + 1.0  # +1cm ease
+
+        # Auto neck if not provided
+        if m.neck_width <= 0:
+            self.neck_width = m.bust / 20 + 2.0
+        else:
+            self.neck_width = m.neck_width
+
+        if m.neck_depth_front <= 0:
+            self.neck_depth_front = self.neck_width + 1.5
+        if m.neck_depth_back <= 0:
+            self.neck_depth_back = self.neck_width * 0.4
+
+        # Shoulder
+        if m.shoulder_width <= 0:
+            self.shoulder_width = m.bust / 4 + 2.0
+        else:
+            self.shoulder_width = m.shoulder_width
+
+        if m.shoulder_length <= 0:
+            self.shoulder_length = 12.0  # typical
+        else:
+            self.shoulder_length = m.shoulder_length
+
+        # Waist dart intake (suppression)
+        self.waist_suppression = self.quarter_bust - self.quarter_waist
+
+        # Bust dart
+        if m.dart_intake_bust <= 0:
+            self.bust_dart = min(self.waist_suppression * 0.6, 4.0)
+        else:
+            self.bust_dart = m.dart_intake_bust
+
+        # Waist darts
+        if m.dart_intake_waist_front <= 0:
+            self.front_waist_dart = min(self.waist_suppression * 0.4, 3.0)
+        else:
+            self.front_waist_dart = m.dart_intake_waist_front
+
+        if m.dart_intake_waist_back <= 0:
+            self.back_waist_dart = min(self.waist_suppression * 0.35, 2.5)
+        else:
+            self.back_waist_dart = m.dart_intake_waist_back
+
+        # Hip depth
+        if m.waist_to_hip <= 0:
+            self.hip_depth = 20.0
+        else:
+            self.hip_depth = m.waist_to_hip
+
+        # Bust span
+        if m.bust_span <= 0:
+            self.bust_span = self.quarter_bust * 0.35
+        else:
+            self.bust_span = m.bust_span
+
+    # ----------------------------------------------------------------
+    # BODICE BLOCK — Front & Back
+    # ----------------------------------------------------------------
+
+    def draft_bodice_front(self) -> PatternPiece:
+        m = self.m
+        qb = self.quarter_bust
+        qw = self.quarter_waist
+        piece = PatternPiece(name="Front Bodice", piece_type="front")
+
+        # Origin at top-left (CF neck point)
+        cf_neck = Point(0, 0)
+
+        # CF line goes down to waist
+        cf_waist = Point(0, -(m.back_length if m.back_length > 0 else 40))
+
+        # Neckline
+        neck_shoulder = Point(self.neck_width, 0)
+        neck_depth = Point(0, -self.neck_depth_front)
+
+        # Shoulder tip
+        shoulder_tip = _polar(neck_shoulder, -25, self.shoulder_length)
+
+        # Armhole
+        ah_top = Point(self.shoulder_width + 1.5, shoulder_tip.y)  # shoulder tip extended
+        ah_depth_y = shoulder_tip.y - self.armhole_depth
+        ah_side = Point(qb + 1.0, ah_depth_y)  # side seam at armhole depth
+
+        # Side seam at waist
+        side_waist = Point(qw + 1.5 + self.front_waist_dart, cf_waist.y)
+
+        # Build outline (CF grain, going clockwise)
+        piece.outline = [
+            cf_neck,
+            neck_shoulder,
+            shoulder_tip,
+            Point(qb + 0.5, shoulder_tip.y - 2),  # armhole curve start
+            ah_side,
+            side_waist,
+            cf_waist,
+        ]
+
+        # Seam line (inset by SA)
+        piece.seam_line = _offset_polyline(piece.outline, -self.sa)
+
+        # Neckline curve
+        piece.internal_lines.append({
+            "type": "curve",
+            "points": [neck_depth, neck_shoulder],
+            "label": "front_neckline",
+        })
+
+        # Bust dart (from side seam pointing to bust apex)
+        apex_x = self.bust_span
+        apex_y = cf_neck.y - (m.shoulder_to_bust if m.shoulder_to_bust > 0 else 10)
+        bust_apex = Point(apex_x, apex_y)
+
+        dart_start = Point(ah_side.x - 2, ah_side.y + 1)
+        piece.darts.append({
+            "start": dart_start.to_tuple(),
+            "end": _polar(dart_start, _angle(dart_start, bust_apex), _dist(dart_start, bust_apex)).to_tuple(),
+            "apex": bust_apex.to_tuple(),
+            "intake": self.bust_dart,
+        })
+
+        # Waist dart (CF to side)
+        waist_dart_start = Point(self.quarter_bust * 0.4, cf_waist.y)
+        waist_dart_end = Point(self.quarter_bust * 0.4 + self.front_waist_dart, cf_waist.y)
+        waist_dart_apex = Point(self.quarter_bust * 0.4 + self.front_waist_dart / 2, cf_waist.y + 8)
+        piece.darts.append({
+            "start": waist_dart_start.to_tuple(),
+            "end": waist_dart_end.to_tuple(),
+            "apex": waist_dart_apex.to_tuple(),
+            "intake": self.front_waist_dart,
+        })
+
+        # Grainline (vertical, CF direction)
+        piece.grainline = {
+            "start": Point(self.quarter_bust * 0.3, shoulder_tip.y - 5).to_tuple(),
+            "end": Point(self.quarter_bust * 0.3, cf_waist.y + 5).to_tuple(),
+            "direction": "vertical",
+        }
+
+        # Notches
+        piece.notches.append(Point(shoulder_tip.x - 2, shoulder_tip.y))     # shoulder notch
+        piece.notches.append(Point(ah_side.x, ah_side.y - 1))                # armhole balance notch
+        piece.notches.append(Point(self.bust_span, ah_depth_y))              # bust notch
+
+        # Mirror axis (CF)
+        piece.mirror_axis = {
+            "start": cf_neck.to_tuple(),
+            "end": cf_waist.to_tuple(),
+        }
+
+        # Annotations
+        piece.annotations.append({"pos": (self.quarter_bust / 2, 2), "text": "FRONT BODICE"})
+        piece.annotations.append({"pos": (0, -5), "text": "CF"})
+
+        piece.meta = {"garment": "bodice", "side": "front", "block": "basic"}
+        return piece
+
+    def draft_bodice_back(self) -> PatternPiece:
+        m = self.m
+        qb = self.quarter_bust
+        qw = self.quarter_waist
+        piece = PatternPiece(name="Back Bodice", piece_type="back")
+
+        # Origin at CB neck
+        cb_neck = Point(0, 0)
+        cb_waist = Point(0, -(m.back_length if m.back_length > 0 else 40))
+
+        # Neckline (back, shallower)
+        neck_shoulder = Point(self.neck_width, 0)
+        neck_depth = Point(0, -self.neck_depth_back)
+
+        # Shoulder tip (back shoulder is typically 1cm shorter)
+        shoulder_tip = _polar(neck_shoulder, -22, self.shoulder_length - 1)
+
+        # Armhole
+        ah_side = Point(qb, shoulder_tip.y - self.armhole_depth)
+
+        # Side seam
+        side_waist = Point(qw + 1.5 + self.back_waist_dart, cb_waist.y)
+
+        piece.outline = [
+            cb_neck,
+            neck_shoulder,
+            shoulder_tip,
+            Point(qb - 0.5, shoulder_tip.y - 2),
+            ah_side,
+            side_waist,
+            cb_waist,
+        ]
+
+        piece.seam_line = _offset_polyline(piece.outline, -self.sa)
+
+        # Neckline curve
+        piece.internal_lines.append({
+            "type": "curve",
+            "points": [neck_depth, neck_shoulder],
+            "label": "back_neckline",
+        })
+
+        # Shoulder dart (back)
+        if self.back_waist_dart > 0:
+            sd_mid = _midpoint(neck_shoulder, shoulder_tip)
+            sd_apex = _polar(sd_mid, -90 - 30, 6)
+            piece.darts.append({
+                "start": _polar(sd_mid, _angle(neck_shoulder, shoulder_tip) - 90, 0.5).to_tuple(),
+                "end": _polar(sd_mid, _angle(neck_shoulder, shoulder_tip) + 90, 0.5).to_tuple(),
+                "apex": sd_apex.to_tuple(),
+                "intake": 1.0,
+            })
+
+        # Waist dart (back)
+        waist_dart_start = Point(self.quarter_bust * 0.45, cb_waist.y)
+        waist_dart_end = Point(self.quarter_bust * 0.45 + self.back_waist_dart, cb_waist.y)
+        waist_dart_apex = Point(self.quarter_bust * 0.45 + self.back_waist_dart / 2, cb_waist.y + 9)
+        piece.darts.append({
+            "start": waist_dart_start.to_tuple(),
+            "end": waist_dart_end.to_tuple(),
+            "apex": waist_dart_apex.to_tuple(),
+            "intake": self.back_waist_dart,
+        })
+
+        # Grainline
+        piece.grainline = {
+            "start": Point(self.quarter_bust * 0.3, shoulder_tip.y - 5).to_tuple(),
+            "end": Point(self.quarter_bust * 0.3, cb_waist.y + 5).to_tuple(),
+            "direction": "vertical",
+        }
+
+        # Notches
+        piece.notches.append(_midpoint(neck_shoulder, shoulder_tip))  # shoulder notch
+        piece.notches.append(Point(ah_side.x - 2, ah_side.y))         # armhole notch
+
+        # Mirror axis (CB)
+        piece.mirror_axis = {
+            "start": cb_neck.to_tuple(),
+            "end": cb_waist.to_tuple(),
+        }
+
+        piece.annotations.append({"pos": (self.quarter_bust / 2, 2), "text": "BACK BODICE"})
+        piece.annotations.append({"pos": (0, -5), "text": "CB"})
+
+        piece.meta = {"garment": "bodice", "side": "back", "block": "basic"}
+        return piece
+
+    # ----------------------------------------------------------------
+    # SKIRT BLOCK
+    # ----------------------------------------------------------------
+
+    def draft_skirt(self) -> list[PatternPiece]:
+        """Drafts front and back skirt panels."""
+        pieces: list[PatternPiece] = []
+        qh = self.quarter_hip
+        qw = self.quarter_waist
+        length = self.m.skirt_length if self.m.skirt_length > 0 else 60
+
+        for side, dart_intake in [("front", min((qh - qw) * 0.4, 3.0)),
+                                   ("back", min((qh - qw) * 0.5, 3.5))]:
+            piece = PatternPiece(
+                name=f"{side.capitalize()} Skirt",
+                piece_type=side,
+            )
+
+            # Origin at CF/CB waist
+            waist_top = Point(0, 0)
+            waist_side = Point(qh - 0.5, 0)
+            hip_line = Point(qh - 0.5, -self.hip_depth)
+            hem_side = Point(qh + 1.5, -length)
+            hem_center = Point(0, -length)
+
+            piece.outline = [waist_top, waist_side, hem_side, hem_center]
+
+            piece.seam_line = _offset_polyline(piece.outline, -self.sa)
+
+            # Hip line
+            piece.internal_lines.append({
+                "type": "reference",
+                "points": [Point(0, -self.hip_depth).to_tuple(),
+                           Point(qh, -self.hip_depth).to_tuple()],
+                "label": "hip_line",
+            })
+
+            # Waist darts (2 darts per panel)
+            dart1_pos = qh * 0.3
+            dart2_pos = qh * 0.65
+
+            for dp, di in [(dart1_pos, dart_intake * 0.45), (dart2_pos, dart_intake * 0.55)]:
+                if di > 0.5:
+                    piece.darts.append({
+                        "start": Point(dp, 0).to_tuple(),
+                        "end": Point(dp + di, 0).to_tuple(),
+                        "apex": Point(dp + di / 2, -9).to_tuple(),
+                        "intake": di,
+                    })
+
+            # Grainline (centered, vertical)
+            piece.grainline = {
+                "start": Point(qh * 0.4, -5).to_tuple(),
+                "end": Point(qh * 0.4, -length + 5).to_tuple(),
+                "direction": "vertical",
+            }
+
+            # Notches
+            piece.notches.append(Point(qh * 0.4, -self.hip_depth))  # hip notch
+            piece.notches.append(Point(qh - 1, -self.hip_depth))    # side seam notch
+
+            # Mirror axis (CF/CB)
+            piece.mirror_axis = {
+                "start": waist_top.to_tuple(),
+                "end": hem_center.to_tuple(),
+            }
+
+            piece.annotations.append({
+                "pos": (qh / 2, -length / 2),
+                "text": f"{side.upper()} SKIRT",
+            })
+            piece.meta = {"garment": "skirt", "side": side, "block": "basic"}
+            pieces.append(piece)
+
+        return pieces
+
+    # ----------------------------------------------------------------
+    # SLEEVE BLOCK
+    # ----------------------------------------------------------------
+
+    def draft_sleeve(self) -> PatternPiece:
+        m = self.m
+        piece = PatternPiece(name="Sleeve", piece_type="sleeve")
+
+        # Bicep = half armhole + ease
+        if m.bicep <= 0:
+            bicep = self.armhole_depth * 2 + 4.0  # approx from scye
+        else:
+            bicep = m.bicep + 3.0  # ease
+
+        wrist = m.wrist + 4.0 if m.wrist > 0 else bicep * 0.4
+
+        sleeve_length = m.sleeve_length if m.sleeve_length > 0 else 60
+
+        # Cap height = roughly 1/3 of armhole depth
+        cap_height = self.armhole_depth * 0.4 + 2.0
+
+        # Construction
+        bicep_line_y = -cap_height
+        wrist_line_y = -cap_height - sleeve_length + cap_height
+
+        # Center line vertical
+        center_top = Point(bicep / 2, 0)       # cap top
+        center_wrist = Point(bicep / 2, -sleeve_length)
+
+        # Bicep ends
+        bicep_front = Point(0, bicep_line_y)
+        bicep_back = Point(bicep, bicep_line_y)
+
+        # Wrist
+        wrist_front = Point((bicep - wrist) / 2, -sleeve_length)
+        wrist_back = Point(bicep - (bicep - wrist) / 2, -sleeve_length)
+
+        # Cap curve (simplified bell curve)
+        cap_front = _polar(bicep_front, 80, cap_height * 0.7)
+        cap_back = _polar(bicep_back, 100, cap_height * 0.7)
+
+        piece.outline = [
+            bicep_front,
+            cap_front,
+            center_top,
+            cap_back,
+            bicep_back,
+            wrist_back,
+            wrist_front,
+        ]
+
+        piece.seam_line = _offset_polyline(piece.outline, -self.sa)
+
+        # Grainline (center, vertical)
+        piece.grainline = {
+            "start": center_top.to_tuple(),
+            "end": center_wrist.to_tuple(),
+            "direction": "vertical",
+        }
+
+        # Notches
+        piece.notches.append(center_top)                       # cap notch (balance)
+        piece.notches.append(_midpoint(bicep_front, cap_front))  # front armhole notch
+        piece.notches.append(_midpoint(bicep_back, cap_back))    # back armhole notch
+        piece.notches.append(Point(bicep / 2, -sleeve_length))   # wrist center notch
+
+        # Elbow line
+        elbow_y = bicep_line_y + (wrist_line_y - bicep_line_y) * 0.5
+        piece.internal_lines.append({
+            "type": "reference",
+            "points": [Point(0, elbow_y).to_tuple(),
+                       Point(bicep, elbow_y).to_tuple()],
+            "label": "elbow_line",
+        })
+
+        # Mirror axis (bicep center)
+        piece.mirror_axis = {
+            "start": center_top.to_tuple(),
+            "end": center_wrist.to_tuple(),
+        }
+
+        piece.annotations.append({"pos": (bicep / 2, -sleeve_length / 2), "text": "SLEEVE"})
+        piece.meta = {"garment": "sleeve", "block": "basic"}
+        return piece
+
+    # ----------------------------------------------------------------
+    # SHIRT BLOCK (looser bodice with more ease)
+    # ----------------------------------------------------------------
+
+    def draft_shirt(self) -> list[PatternPiece]:
+        m = self.m
+        pieces: list[PatternPiece] = []
+
+        # Use loose ease for shirts
+        self.ease_value = config.EASE_BODICE.get("loose", 6.0)
+        self.quarter_bust = (m.bust + self.ease_value) / 4
+        self.quarter_waist = (m.waist + 4) / 4   # shirts have more waist ease
+
+        front = self.draft_bodice_front()
+        front.name = "Front Shirt"
+        front.meta["garment"] = "shirt"
+        front.annotations[0]["text"] = "FRONT SHIRT"
+        pieces.append(front)
+
+        back = self.draft_bodice_back()
+        back.name = "Back Shirt"
+        back.meta["garment"] = "shirt"
+        back.annotations[0]["text"] = "BACK SHIRT"
+        pieces.append(back)
+
+        # Add sleeve if measurements available
+        if m.sleeve_length > 0:
+            sleeve = self.draft_sleeve()
+            sleeve.meta["garment"] = "shirt"
+            pieces.append(sleeve)
+
+        # Shirt collar (simple band)
+        collar = self._draft_collar_band()
+        pieces.append(collar)
+
+        return pieces
+
+    def _draft_collar_band(self) -> PatternPiece:
+        neck_opening = self.neck_width * 2 * math.pi * 0.4  # approximate neck circumference
+        collar_height = 4.0
+
+        piece = PatternPiece(name="Collar Band", piece_type="collar")
+        piece.outline = [
+            Point(0, 0),
+            Point(neck_opening / 2, 0),
+            Point(neck_opening / 2, collar_height),
+            Point(0, collar_height),
+        ]
+        piece.seam_line = _offset_polyline(piece.outline, -self.sa)
+        piece.grainline = {
+            "start": (neck_opening / 4, 1),
+            "end": (neck_opening / 4, collar_height - 1),
+            "direction": "vertical",
+        }
+        piece.annotations.append({"pos": (neck_opening / 4, collar_height / 2), "text": "COLLAR"})
+        piece.meta = {"garment": "collar", "block": "basic"}
+        return piece
+
+    # ----------------------------------------------------------------
+    # DRESS / KURTI (bodice + skirt combined)
+    # ----------------------------------------------------------------
+
+    def draft_dress(self, garment_label: str = "DRESS") -> list[PatternPiece]:
+        m = self.m
+        pieces: list[PatternPiece] = []
+
+        # Bodice pieces
+        front_bodice = self.draft_bodice_front()
+        front_bodice.name = f"Front {garment_label.title()} Bodice"
+        front_bodice.meta["garment"] = garment_label.lower()
+        pieces.append(front_bodice)
+
+        back_bodice = self.draft_bodice_back()
+        back_bodice.name = f"Back {garment_label.title()} Bodice"
+        back_bodice.meta["garment"] = garment_label.lower()
+        pieces.append(back_bodice)
+
+        # Skirt portion (full length minus bodice)
+        if m.dress_length > 0:
+            self.m.skirt_length = max(m.dress_length - (m.back_length if m.back_length > 0 else 40), 20)
+            skirt_pieces = self.draft_skirt()
+            for sp in skirt_pieces:
+                sp.name = sp.name.replace("Skirt", f"{garment_label.title()} Skirt")
+                sp.meta["garment"] = garment_label.lower()
+            pieces.extend(skirt_pieces)
+
+        # Sleeve
+        if m.sleeve_length > 0:
+            sleeve = self.draft_sleeve()
+            sleeve.meta["garment"] = garment_label.lower()
+            pieces.append(sleeve)
+
+        # Facing for neckline
+        facing = self._draft_neck_facing()
+        facing.meta["garment"] = garment_label.lower()
+        pieces.append(facing)
+
+        return pieces
+
+    # ----------------------------------------------------------------
+    # NECK FACING
+    # ----------------------------------------------------------------
+
+    def _draft_neck_facing(self) -> PatternPiece:
+        piece = PatternPiece(name="Neck Facing", piece_type="facing")
+        nw = self.neck_width
+        nd = self.neck_depth_front
+        facing_depth = 5.0
+
+        piece.outline = [
+            Point(0, 0),
+            Point(nw + 2, 0),
+            Point(nw + 2, -facing_depth),
+            Point(0, -facing_depth - nd * 0.3),
+        ]
+        piece.seam_line = _offset_polyline(piece.outline, -self.sa)
+        piece.grainline = {
+            "start": (nw / 2, 0),
+            "end": (nw / 2, -facing_depth),
+            "direction": "vertical",
+        }
+        piece.annotations.append({"pos": (nw / 2, -facing_depth / 2), "text": "NECK FACING"})
+        piece.meta = {"garment": "facing", "block": "derived"}
+        return piece
+
+    # ----------------------------------------------------------------
+    # MASTER DISPATCHER
+    # ----------------------------------------------------------------
+
+    def draft(self, garment_type: str) -> list[PatternPiece]:
+        """Main dispatch — routes to the correct drafting method."""
+        gt = garment_type.lower().strip()
+
+        if gt in ("dress",):
+            return self.draft_dress("dress")
+        elif gt in ("kurti", "kurti"):
+            return self.draft_dress("kurti")
+        elif gt == "bodice":
+            return [self.draft_bodice_front(), self.draft_bodice_back()]
+        elif gt == "skirt":
+            return self.draft_skirt()
+        elif gt == "shirt":
+            return self.draft_shirt()
+        elif gt == "sleeve":
+            return [self.draft_sleeve()]
+        else:
+            # Default: dress/kurti block
+            return self.draft_dress("dress")
+
+
+# ====================================================================
+# DXF / AAMA EXPORT ENGINE
+# ====================================================================
+
+class DXFExporter:
+    """Exports PatternPieces to a DXF file using AAMA layer conventions."""
+
+    def __init__(self):
+        self.layers = config.AAMA_LAYERS
+
+    def export(self, pieces: list[PatternPiece], filepath: str,
+               garment_type: str = "garment",
+               measurements: Optional[Measurements] = None) -> str:
+        doc = ezdxf.new(dxfversion="R2000")
+        msp = doc.modelspace()
+
+        # Set up AAMA layers
+        self._setup_layers(doc)
+
+        # Each piece gets its own block for clean nesting
+        offset_x = 0
+        col_count = 0
+        max_cols = 3  # 3 pieces per row
+        col_width = 50  # cm spacing
+
+        for piece in pieces:
+            self._draw_piece(doc, msp, piece, offset_x, 0)
+            col_count += 1
+            if col_count >= max_cols:
+                offset_x = 0
+                # Move to next row (downward in Y)
+            else:
+                offset_x += col_width
+
+        # Header info
+        self._add_header(msp, garment_type, measurements)
+
+        doc.saveas(filepath)
+        return filepath
+
+    def _setup_layers(self, doc):
+        """Create AAMA-standard layers with appropriate colors."""
+        layer_defs = [
+            (self.layers["CUT"], 1),         # Red — cutting line
+            (self.layers["SEAM"], 5),         # Blue — seam line
+            (self.layers["GRAIN"], 3),        # Green — grainline
+            (self.layers["NOTCH"], 2),        # Yellow — notches
+            (self.layers["INTERNAL"], 6),     # Magenta — internal
+            (self.layers["REFERENCE"], 8),    # Gray — reference
+            (self.layers["ANNOTATION"], 7),   # White — text
+            (self.layers["MIRROR"], 4),       # Cyan — mirror
+        ]
+        for name, color in layer_defs:
+            if name not in doc.layers:
+                doc.layers.add(name=name, color=color)
+
+    def _draw_piece(self, doc, msp, piece: PatternPiece,
+                    offset_x: float, offset_y: float):
+        """Draw a single pattern piece with all AAMA elements."""
+        ox, oy = offset_x, offset_y
+
+        # --- Cutting outline (CUT layer) ---
+        if piece.outline:
+            pts = [(p.x + ox, p.y + oy) for p in piece.outline]
+            pts.append(pts[0])  # close
+            msp.add_lwpolyline(pts, dxfattribs={
+                "layer": self.layers["CUT"],
+                "linetype": "CONTINUOUS",
+                "lineweight": 35,  # thick
+            })
+
+        # --- Seam line (SEAM layer, dashed) ---
+        if piece.seam_line:
+            pts = [(p.x + ox, p.y + oy) for p in piece.seam_line]
+            pts.append(pts[0])
+            msp.add_lwpolyline(pts, dxfattribs={
+                "layer": self.layers["SEAM"],
+                "linetype": "DASHED",
+            })
+
+        # --- Darts (INTERNAL layer) ---
+        for dart in piece.darts:
+            start = dart.get("start")
+            end = dart.get("end")
+            apex = dart.get("apex")
+            if start and end and apex:
+                # Handle both Point objects and tuples
+                sx, sy = (start.x, start.y) if hasattr(start, 'x') else (start[0], start[1])
+                ex, ey = (end.x, end.y) if hasattr(end, 'x') else (end[0], end[1])
+                ax, ay = (apex.x, apex.y) if hasattr(apex, 'x') else (apex[0], apex[1])
+                # Dart legs (two lines converging at apex)
+                msp.add_line(
+                    (sx + ox, sy + oy),
+                    (ax + ox, ay + oy),
+                    dxfattribs={"layer": self.layers["INTERNAL"]},
+                )
+                msp.add_line(
+                    (ex + ox, ey + oy),
+                    (ax + ox, ay + oy),
+                    dxfattribs={"layer": self.layers["INTERNAL"]},
+                )
+
+        # --- Notches (NOTCH layer) ---
+        for notch in piece.notches:
+            nx, ny = notch.x + ox, notch.y + oy
+            # Perpendicular notch mark (small line)
+            msp.add_line(
+                (nx - 0.5, ny), (nx + 0.5, ny),
+                dxfattribs={"layer": self.layers["NOTCH"]},
+            )
+            msp.add_line(
+                (nx, ny - 0.5), (nx, ny + 0.5),
+                dxfattribs={"layer": self.layers["NOTCH"]},
+            )
+
+        # --- Grainline (GRAIN layer) ---
+        if piece.grainline:
+            gl = piece.grainline
+            start = gl.get("start")
+            end = gl.get("end")
+            if start and end:
+                sx, sy = (start.x, start.y) if hasattr(start, 'x') else (start[0], start[1])
+                ex, ey = (end.x, end.y) if hasattr(end, 'x') else (end[0], end[1])
+                msp.add_line(
+                    (sx + ox, sy + oy), (ex + ox, ey + oy),
+                    dxfattribs={"layer": self.layers["GRAIN"], "linetype": "PHANTOM"},
+                )
+                # Arrow heads (simple)
+                angle = math.atan2(ey - sy, ex - sx)
+                arrow_size = 1.5
+                for ang in [angle + math.pi - 0.4, angle + math.pi + 0.4]:
+                    msp.add_line(
+                        (sx + ox, sy + oy),
+                        (sx + ox + arrow_size * math.cos(ang),
+                         sy + oy + arrow_size * math.sin(ang)),
+                        dxfattribs={"layer": self.layers["GRAIN"]},
+                    )
+
+        # --- Internal lines ---
+        for iline in piece.internal_lines:
+            pts = iline.get("points", [])
+            if len(pts) >= 2:
+                for i in range(len(pts) - 1):
+                    p1 = pts[i]
+                    p2 = pts[i + 1]
+                    # Handle both Point objects and tuples
+                    x1, y1 = (p1.x, p1.y) if hasattr(p1, 'x') else (p1[0], p1[1])
+                    x2, y2 = (p2.x, p2.y) if hasattr(p2, 'x') else (p2[0], p2[1])
+                    msp.add_line(
+                        (x1 + ox, y1 + oy),
+                        (x2 + ox, y2 + oy),
+                        dxfattribs={"layer": self.layers["INTERNAL"]},
+                    )
+
+        # --- Mirror axis ---
+        if piece.mirror_axis:
+            ma = piece.mirror_axis
+            s = ma.get("start")
+            e = ma.get("end")
+            if s and e:
+                sx, sy = (s.x, s.y) if hasattr(s, 'x') else (s[0], s[1])
+                ex, ey = (e.x, e.y) if hasattr(e, 'x') else (e[0], e[1])
+                msp.add_line(
+                    (sx + ox, sy + oy),
+                    (ex + ox, ey + oy),
+                    dxfattribs={
+                        "layer": self.layers["MIRROR"],
+                        "linetype": "CENTER",
+                    },
+                )
+
+        # --- Annotations (text) ---
+        for ann in piece.annotations:
+            pos = ann.get("pos", (0, 0))
+            text = ann.get("text", "")
+            msp.add_text(
+                text,
+                dxfattribs={
+                    "layer": self.layers["ANNOTATION"],
+                    "height": 1.5,
+                    "rotation": 0,
+                },
+            ).set_placement((pos[0] + ox, pos[1] + oy))
+
+    def _add_header(self, msp, garment_type: str,
+                    measurements: Optional[Measurements]):
+        """Add a header block with garment info."""
+        header_y = 5
+        info_lines = [
+            f"GARMENT: {garment_type.upper()}",
+            f"DATE: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+        ]
+        if measurements:
+            info_lines.extend([
+                f"BUST: {measurements.bust}cm",
+                f"WAIST: {measurements.waist}cm",
+                f"HIP: {measurements.hip}cm",
+            ])
+
+        for i, line in enumerate(info_lines):
+            msp.add_text(
+                line,
+                dxfattribs={
+                    "layer": self.layers["ANNOTATION"],
+                    "height": 1.2,
+                },
+            ).set_placement((-5, header_y + i * 2))
+
+
+# ====================================================================
+# PDS TEMPLATE DATABASE
+# ====================================================================
+
+class TemplateDB:
+    """SQLite-based storage for PDS templates and matched specs."""
+
+    def __init__(self, db_path: str = None):
+        self.db_path = db_path or config.DATABASE_PATH
+        os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
+        self._init_db()
+
+    def _init_db(self):
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS templates (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                garment_type TEXT NOT NULL,
+                garment_subtype TEXT,
+                size_label TEXT,
+                measurements_json TEXT NOT NULL,
+                file_path TEXT,
+                file_hash TEXT,
+                metadata_json TEXT,
+                created_at TEXT DEFAULT (datetime('now', 'localtime')),
+                updated_at TEXT DEFAULT (datetime('now', 'localtime'))
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_garment_type
+            ON templates(garment_type)
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_file_hash
+            ON templates(file_hash)
+        """)
+        conn.commit()
+        conn.close()
+
+    def store_template(self, garment_type: str, measurements: dict,
+                       file_path: str = None, subtype: str = None,
+                       size_label: str = None, metadata: dict = None) -> int:
+        conn = sqlite3.connect(self.db_path)
+        file_hash = None
+        if file_path and os.path.exists(file_path):
+            with open(file_path, "rb") as f:
+                file_hash = hashlib.sha256(f.read()).hexdigest()
+
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO templates (garment_type, garment_subtype, size_label,
+                                   measurements_json, file_path, file_hash, metadata_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (
+            garment_type, subtype, size_label,
+            json.dumps(measurements), file_path, file_hash,
+            json.dumps(metadata or {}),
+        ))
+        conn.commit()
+        template_id = cursor.lastrowid
+        conn.close()
+        return template_id
+
+    def find_match(self, garment_type: str, measurements: dict,
+                   tolerance: float = 3.0) -> Optional[dict]:
+        """Find the closest matching template by measurements."""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT id, garment_type, measurements_json, file_path, metadata_json
+            FROM templates
+            WHERE garment_type = ?
+            ORDER BY created_at DESC
+        """, (garment_type,))
+        rows = cursor.fetchall()
+        conn.close()
+
+        best_match = None
+        best_score = float("inf")
+
+        for row in rows:
+            stored_measurements = json.loads(row[2])
+            score = self._measurement_distance(measurements, stored_measurements)
+            if score < best_score and score < tolerance * len(measurements):
+                best_score = score
+                best_match = {
+                    "id": row[0],
+                    "garment_type": row[1],
+                    "measurements": stored_measurements,
+                    "file_path": row[3],
+                    "metadata": json.loads(row[4]) if row[4] else {},
+                    "score": best_score,
+                }
+
+        return best_match
+
+    def _measurement_distance(self, m1: dict, m2: dict) -> float:
+        """Euclidean distance between two measurement sets (numeric fields only)."""
+        common_keys = set(m1.keys()) & set(m2.keys())
+        if not common_keys:
+            return float("inf")
+        dist = 0.0
+        for k in common_keys:
+            try:
+                v1 = float(m1.get(k, 0))
+                v2 = float(m2.get(k, 0))
+            except (ValueError, TypeError):
+                continue  # skip non-numeric fields like 'ease'
+            if v1 > 0 and v2 > 0:
+                dist += abs(v1 - v2) ** 2
+        return math.sqrt(dist)
+
+    def list_templates(self, garment_type: str = None) -> list[dict]:
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        if garment_type:
+            cursor.execute("""
+                SELECT id, garment_type, garment_subtype, size_label,
+                       measurements_json, file_path, created_at
+                FROM templates WHERE garment_type = ?
+                ORDER BY created_at DESC
+            """, (garment_type,))
+        else:
+            cursor.execute("""
+                SELECT id, garment_type, garment_subtype, size_label,
+                       measurements_json, file_path, created_at
+                FROM templates ORDER BY created_at DESC
+            """)
+        rows = cursor.fetchall()
+        conn.close()
+
+        return [{
+            "id": r[0], "garment_type": r[1], "subtype": r[2],
+            "size_label": r[3], "measurements": json.loads(r[4]),
+            "file_path": r[5], "created_at": r[6],
+        } for r in rows]
+
+    def delete_template(self, template_id: int) -> bool:
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM templates WHERE id = ?", (template_id,))
+        conn.commit()
+        deleted = cursor.rowcount > 0
+        conn.close()
+        return deleted
+
+
+# ====================================================================
+# HIGH-LEVEL API
+# ====================================================================
+
+def generate_pattern(measurements: Measurements | dict,
+                     garment_type: str = "dress",
+                     ease: str = "standard",
+                     output_path: str = None) -> str:
+    """
+    Master function — takes measurements and garment type, returns path to DXF.
+
+    Args:
+        measurements: Measurements object or dict of measurement values (cm)
+        garment_type: dress | kurti | bodice | skirt | shirt | sleeve
+        ease: minimal | standard | loose
+        output_path: where to save the DXF file (auto-generated if None)
+
+    Returns:
+        Path to the generated DXF file.
+    """
+    # Normalise measurements
+    if isinstance(measurements, dict):
+        m = Measurements(**{k: v for k, v in measurements.items()
+                           if hasattr(Measurements, k)})
+    else:
+        m = measurements
+
+    if not m.validate():
+        raise ValueError(
+            f"Insufficient measurements. Missing: {m.missing_keys()}"
+        )
+
+    # Draft
+    engine = DraftingEngine(m, ease=ease)
+    pieces = engine.draft(garment_type)
+
+    # Export
+    if output_path is None:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_path = os.path.join(config.OUTPUT_DIR,
+                                   f"{garment_type}_pattern_{timestamp}.dxf")
+
+    exporter = DXFExporter()
+    exporter.export(pieces, output_path, garment_type=garment_type,
+                    measurements=m)
+
+    return output_path
+
+
+def generate_spec_summary(measurements: Measurements | dict,
+                          garment_type: str = "dress",
+                          ease: str = "standard") -> str:
+    """
+    Returns a human-readable garment specification summary.
+    """
+    if isinstance(measurements, dict):
+        m = Measurements(**{k: v for k, v in measurements.items()
+                           if hasattr(Measurements, k)})
+    else:
+        m = measurements
+
+    engine = DraftingEngine(m, ease=ease)
+    ease_val = engine.ease_value
+    skirt_ease = engine.skirt_ease
+
+    summary = f"""📋 GARMENT SPECIFICATION SUMMARY
+═══════════════════════════════════
+
+GARMENT TYPE: {garment_type.upper()}
+EASE: {ease.upper()} (bodice +{ease_val}cm, skirt +{skirt_ease}cm)
+SEAM ALLOWANCE: {config.SEAM_ALLOWANCE}cm
+HEM ALLOWANCE: {config.HEM_ALLOWANCE}cm
+
+── BODY MEASUREMENTS ──
+Bust:   {m.bust:>6.1f} cm
+Waist:  {m.waist:>6.1f} cm
+Hip:    {m.hip:>6.1f} cm
+"""
+
+    if m.shoulder_width:
+        summary += f"Shoulder: {m.shoulder_width:>5.1f} cm\n"
+    if m.back_length:
+        summary += f"Back Length: {m.back_length:>4.1f} cm\n"
+    if m.sleeve_length:
+        summary += f"Sleeve Length: {m.sleeve_length:>2.1f} cm\n"
+    if m.armhole_depth:
+        summary += f"Armhole Depth: {m.armhole_depth:>2.1f} cm\n"
+
+    summary += f"""
+── DRAFTING COMPUTATIONS ──
+Quarter Bust (w/ ease):  {engine.quarter_bust:.1f} cm
+Quarter Waist (w/ ease): {engine.quarter_waist:.1f} cm
+Quarter Hip (w/ ease):   {engine.quarter_hip:.1f} cm
+Armhole Depth (w/ ease): {engine.armhole_depth:.1f} cm
+Neck Width:              {engine.neck_width:.1f} cm
+Shoulder Length:         {engine.shoulder_length:.1f} cm
+Bust Dart Intake:        {engine.bust_dart:.1f} cm
+Front Waist Dart:        {engine.front_waist_dart:.1f} cm
+Back Waist Dart:         {engine.back_waist_dart:.1f} cm
+
+── PATTERN PIECES ──
+"""
+
+    pieces = engine.draft(garment_type)
+    for p in pieces:
+        summary += f"  • {p.name} ({p.piece_type})\n"
+        if p.darts:
+            summary += f"    Darts: {len(p.darts)}\n"
+        if p.notches:
+            summary += f"    Notches: {len(p.notches)}\n"
+        if p.grainline:
+            summary += f"    Grainline: {p.grainline.get('direction', 'vertical')}\n"
+
+    summary += f"""
+── CONSTRUCTION NOTES ──
+• All pieces drafted on grain (vertical grainlines)
+• Seam allowance: {config.SEAM_ALLOWANCE}cm on all edges
+• Hem allowance: {config.HEM_ALLOWANCE}cm
+• Mirror axes marked for CF/CB pieces
+• Notches indicate balance points and alignment marks
+• DXF export uses AAMA layer standards (Optitex/Gerber/Lectra compatible)
+
+Ready to draft? Reply /confirm to generate the DXF file.
+"""
+    return summary
+
+
+# ====================================================================
+# CLI ENTRY POINT (for testing)
+# ====================================================================
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="2D Garment Pattern Generator")
-    parser.add_argument("--measurements", "-m", required=True,
-                        help="Path to measurements JSON file")
-    parser.add_argument("--garment-type", "-g", required=True,
-                        help="Garment type: tshirt_dress, shirt, jacket, pants")
-    parser.add_argument("--output", "-o", default="output",
-                        help="Output directory (default: output)")
-    parser.add_argument("--title", "-t", default=None,
-                        help="Pattern title for DXF/preview")
+    # Example usage
+    m = Measurements(
+        bust=92, waist=72, hip=96,
+        shoulder_width=38, back_length=40,
+        sleeve_length=58, armhole_depth=22,
+        skirt_length=60, dress_length=100,
+    )
+    print("=== DRESS PATTERN GENERATION ===\n")
+    print(generate_spec_summary(m, "dress"))
+    path = generate_pattern(m, "dress", output_path="test_dress.dxf")
+    print(f"\nDXF saved to: {path}")
 
-    args = parser.parse_args()
-
-    with open(args.measurements) as f:
-        measurements = json.load(f)
-
-    result = generate_pattern(measurements, args.garment_type, args.output, args.title)
-    print(f"\nDone! Files in {args.output}/")
-Extension
-Extension Embed
-
-
-
-Actions
-
-Your Business
-
-Settings
-
-Help
-Search Amazon
-
-United States
-Search Amazon
-
+    # Test template DB
+    db = TemplateDB()
+    db.store_template("dress", asdict(m),
+                      file_path="test_dress.dxf",
+                      size_label="M")
+    print(f"\nTemplates: {len(db.list_templates('dress'))} dress templates stored")
+    match = db.find_match("dress", asdict(m))
+    if match:
+        print(f"Best match: template #{match['id']} (score: {match['score']:.2f})")
