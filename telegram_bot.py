@@ -1,18 +1,20 @@
+# telegram_bot.py
+
 import os
 import json
 import base64
-import re
 import requests
-import threading
-import uuid
+import asyncio
 import logging
-from pathlib import Path
-from http.server import HTTPServer, BaseHTTPRequestHandler
+import uuid
+import shutil
 
+from pathlib import Path
 from dotenv import load_dotenv
 
 from telegram import Update
 from telegram.request import HTTPXRequest
+
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -21,31 +23,82 @@ from telegram.ext import (
     filters,
 )
 
-from generator import generate_technical_draft_and_dxf
+from generator import (
+    generate_technical_draft_and_dxf,
+    save_pattern_to_database,
+    build_pattern_plan,
+)
 
 
 # ============================================================
-# ENVIRONMENT
+# ENV
 # ============================================================
 
 load_dotenv()
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+TELEGRAM_BOT_TOKEN = os.getenv(
+    "TELEGRAM_BOT_TOKEN"
+)
 
-OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+OPENROUTER_API_KEY = os.getenv(
+    "OPENROUTER_API_KEY"
+)
 
-# Free router automatically selects an available compatible model
-OPENROUTER_MODEL = "openrouter/free"
+OPENROUTER_URL = (
+    "https://openrouter.ai/api/v1/chat/completions"
+)
 
-PORT = int(os.getenv("PORT", "8080"))
+OPENROUTER_MODEL = os.getenv(
+    "OPENROUTER_MODEL",
+    "openrouter/free"
+)
 
-BASE_DIR = Path(__file__).resolve().parent
-TEMP_DIR = BASE_DIR / "temp"
-OUTPUT_DIR = BASE_DIR / "output"
 
-TEMP_DIR.mkdir(exist_ok=True)
-OUTPUT_DIR.mkdir(exist_ok=True)
+# ============================================================
+# DIRECTORIES
+# ============================================================
+
+BASE_DIR = Path(
+    __file__
+).resolve().parent
+
+DATA_DIR = (
+    BASE_DIR /
+    "pattern_data"
+)
+
+ORIGINAL_DXF_DIR = (
+    DATA_DIR /
+    "original_dxf"
+)
+
+TEMP_DIR = (
+    DATA_DIR /
+    "temp"
+)
+
+OUTPUT_DIR = (
+    DATA_DIR /
+    "generated_dxf"
+)
+
+PREVIEW_DIR = (
+    DATA_DIR /
+    "previews"
+)
+
+for directory in [
+    DATA_DIR,
+    ORIGINAL_DXF_DIR,
+    TEMP_DIR,
+    OUTPUT_DIR,
+    PREVIEW_DIR,
+]:
+
+    directory.mkdir(
+        parents=True,
+        exist_ok=True
+    )
 
 
 # ============================================================
@@ -54,93 +107,86 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
+    format=(
+        "%(asctime)s | "
+        "%(levelname)s | "
+        "%(message)s"
+    )
 )
 
-logger = logging.getLogger("GarmentAI")
-
-
-# ============================================================
-# HEALTH CHECK SERVER
-# ============================================================
-
-class HealthCheckHandler(BaseHTTPRequestHandler):
-
-    def do_GET(self):
-
-        self.send_response(200)
-
-        self.send_header(
-            "Content-Type",
-            "text/plain; charset=utf-8"
-        )
-
-        self.end_headers()
-
-        self.wfile.write(
-            b"Garment AI Pattern Engine - Online"
-        )
-
-    def log_message(self, format, *args):
-        return
-
-
-def run_health_server():
-
-    try:
-
-        server = HTTPServer(
-            ("0.0.0.0", PORT),
-            HealthCheckHandler
-        )
-
-        logger.info(
-            f"Health server running on port {PORT}"
-        )
-
-        server.serve_forever()
-
-    except Exception as e:
-
-        logger.error(
-            f"Health server error: {e}"
-        )
+logger = logging.getLogger(
+    "GarmentPatternAI"
+)
 
 
 # ============================================================
 # AI PROMPT
 # ============================================================
 
-GARMENT_ANALYSIS_PROMPT = """
-You are a professional garment technical designer
-and pattern-making assistant.
+ANALYSIS_PROMPT = r"""
+You are a professional garment pattern technologist.
 
 Analyze the uploaded garment management/specification sheet.
 
-Your job is to identify:
+Your task is NOT to invent measurements.
 
-1. Garment type
-2. Size
-3. Measurement unit
-4. All clearly visible measurements
-5. Style/construction details
-6. Sleeve details
-7. Neckline details
-8. Any visible pleats, gathers, darts, panels or special construction
+Determine:
 
-IMPORTANT RULES:
+- garment type
+- size
+- unit
+- visible measurements
+- garment construction
+- neckline
+- sleeve type
+- fit
+- panels
+- darts
+- pleats
+- gathers
+- collar
+- cuff
+- placket
+- pocket
+- special details
 
-- NEVER invent a measurement.
-- NEVER guess a measurement that is not visible.
-- If a measurement is not visible, use null.
-- Preserve fractions such as "2 1/2" or "3/4".
-- Detect the unit from the sheet.
-- If unit is not visible, use null.
+Then determine the most appropriate pattern family.
+
+Possible families:
+
+basic
+tshirt
+shirt
+top
+dress
+
+Determine the required pattern pieces.
+
+Possible pieces:
+
+FRONT
+BACK
+FRONT_BODICE
+BACK_BODICE
+SLEEVE
+COLLAR
+COLLAR_STAND
+CUFF
+PLACKET
+NECKBAND
+POCKET
+FACING
+
+RULES:
+
+- Never invent measurements.
+- Missing measurements = null.
+- Preserve fractions.
 - Return ONLY valid JSON.
-- Do NOT use markdown.
-- Do NOT add explanations.
+- No markdown.
+- No explanation.
 
-Return exactly this structure:
+Return:
 
 {
   "garment_type": null,
@@ -151,20 +197,27 @@ Return exactly this structure:
     "chest": null,
     "waist": null,
     "hip": null,
+    "length": null,
     "length_from_hps": null,
     "shoulder": null,
-
+    "armhole": null,
+    "sleeve_length": null,
+    "sleeve_length_from_neck_seam": null,
     "front_neck_drop": null,
     "back_neck_drop": null,
     "boat_neck_width": null,
-
-    "sleeve_length_from_neck_seam": null,
     "sleeve_opening_elastic": null,
     "sleeve_opening_fabric_flat": null,
-    "sleeve_opening_full_height": null,
-
-    "armhole": null
+    "sleeve_opening_full_height": null
   },
+
+  "pattern_family": "basic",
+
+  "pattern_pieces": [
+    "FRONT",
+    "BACK",
+    "SLEEVE"
+  ],
 
   "style_details": [],
 
@@ -176,26 +229,40 @@ Return exactly this structure:
 
 
 # ============================================================
-# JSON EXTRACTION
+# JSON PARSER
 # ============================================================
 
-def extract_json(text):
+def parse_json(text):
 
     if text is None:
-
-        raise ValueError(
-            "AI ne koi text response nahi diya."
-        )
-
-    text = str(text).strip()
-
-    if not text:
-
-        raise ValueError(
+        raise RuntimeError(
             "AI response empty hai."
         )
 
-    # Remove markdown fences
+    if isinstance(text, list):
+
+        parts = []
+
+        for item in text:
+
+            if isinstance(item, dict):
+
+                if item.get(
+                    "type"
+                ) == "text":
+
+                    parts.append(
+                        item.get(
+                            "text",
+                            ""
+                        )
+                    )
+
+        text = "".join(parts)
+
+    text = str(
+        text
+    ).strip()
 
     text = text.replace(
         "```json",
@@ -209,203 +276,48 @@ def extract_json(text):
 
     text = text.strip()
 
-    # Direct JSON
-
     try:
 
-        return json.loads(text)
+        return json.loads(
+            text
+        )
 
-    except json.JSONDecodeError:
+    except Exception:
 
-        pass
+        start = text.find(
+            "{"
+        )
 
-    # Try extracting JSON object
+        end = text.rfind(
+            "}"
+        )
 
-    start = text.find("{")
-    end = text.rfind("}")
+        if start >= 0 and end > start:
 
-    if start != -1 and end != -1 and end > start:
+            return json.loads(
+                text[
+                    start:end + 1
+                ]
+            )
 
-        candidate = text[
-            start:end + 1
-        ]
-
-        try:
-
-            return json.loads(candidate)
-
-        except json.JSONDecodeError as e:
-
-            raise ValueError(
-                "AI ka JSON incomplete/invalid hai.\n\n"
-                f"Response:\n{text[:3000]}"
-            ) from e
-
-    raise ValueError(
+    raise RuntimeError(
         "AI ne valid JSON return nahi kiya.\n\n"
-        f"Response:\n{text[:3000]}"
+        + text[:2500]
     )
 
 
 # ============================================================
-# NORMALIZE AI DATA
+# AI ANALYSIS
 # ============================================================
 
-def normalize_spec(spec):
-
-    if not isinstance(spec, dict):
-
-        raise ValueError(
-            "AI response JSON object nahi hai."
-        )
-
-    measurements = spec.get(
-        "measurements"
-    )
-
-    if not isinstance(
-        measurements,
-        dict
-    ):
-
-        measurements = {}
-
-    # Compatibility with older AI format
-
-    old_keys = [
-        "chest",
-        "waist",
-        "hip",
-        "length",
-        "shoulder",
-        "sleeve_length",
-        "armhole",
-    ]
-
-    for key in old_keys:
-
-        if key in spec and key not in measurements:
-
-            measurements[key] = spec[key]
-
-    # Map old names to generator names
-
-    if (
-        measurements.get("length_from_hps") is None
-        and measurements.get("length") is not None
-    ):
-
-        measurements["length_from_hps"] = (
-            measurements["length"]
-        )
-
-    if (
-        measurements.get(
-            "sleeve_length_from_neck_seam"
-        ) is None
-        and measurements.get(
-            "sleeve_length"
-        ) is not None
-    ):
-
-        measurements[
-            "sleeve_length_from_neck_seam"
-        ] = measurements[
-            "sleeve_length"
-        ]
-
-    return {
-        "garment_type": spec.get(
-            "garment_type"
-        ),
-
-        "size": spec.get(
-            "size"
-        ),
-
-        "unit": spec.get(
-            "unit"
-        ),
-
-        "measurements": measurements,
-
-        "style_details": spec.get(
-            "style_details",
-            []
-        ),
-
-        "construction_details": spec.get(
-            "construction_details",
-            []
-        ),
-
-        "special_details": spec.get(
-            "special_details",
-            []
-        ),
-    }
-
-
-# ============================================================
-# VALIDATION
-# ============================================================
-
-def validate_spec(spec):
-
-    errors = []
-
-    garment_type = spec.get(
-        "garment_type"
-    )
-
-    unit = spec.get(
-        "unit"
-    )
-
-    measurements = spec.get(
-        "measurements",
-        {}
-    )
-
-    if not garment_type:
-
-        errors.append(
-            "Garment type identify nahi hua."
-        )
-
-    if not unit:
-
-        errors.append(
-            "Measurement unit identify nahi hua."
-        )
-
-    # At least some measurements must exist
-
-    visible_measurements = [
-        value
-        for value in measurements.values()
-        if value is not None
-    ]
-
-    if len(visible_measurements) == 0:
-
-        errors.append(
-            "Koi usable measurement nahi mili."
-        )
-
-    return errors
-
-
-# ============================================================
-# OPENROUTER VISION ANALYSIS
-# ============================================================
-
-def analyze_image(image_path):
+def analyze_management_sheet(
+    image_path
+):
 
     if not OPENROUTER_API_KEY:
 
         raise RuntimeError(
-            "OPENROUTER_API_KEY .env mein missing hai."
+            "OPENROUTER_API_KEY missing hai."
         )
 
     with open(
@@ -413,24 +325,11 @@ def analyze_image(image_path):
         "rb"
     ) as image_file:
 
-        base64_image = base64.b64encode(
+        image_b64 = base64.b64encode(
             image_file.read()
-        ).decode("utf-8")
-
-    headers = {
-
-        "Authorization":
-            f"Bearer {OPENROUTER_API_KEY}",
-
-        "Content-Type":
-            "application/json",
-
-        "HTTP-Referer":
-            "http://localhost:8000",
-
-        "X-Title":
-            "Garment AI Pattern Manager",
-    }
+        ).decode(
+            "utf-8"
+        )
 
     payload = {
 
@@ -450,7 +349,7 @@ def analyze_image(image_path):
                             "text",
 
                         "text":
-                            GARMENT_ANALYSIS_PROMPT
+                            ANALYSIS_PROMPT
                     },
 
                     {
@@ -460,8 +359,10 @@ def analyze_image(image_path):
                         "image_url": {
 
                             "url":
-                                "data:image/jpeg;base64,"
-                                + base64_image
+                                (
+                                    "data:image/jpeg;base64,"
+                                    + image_b64
+                                )
                         }
                     }
                 ]
@@ -472,46 +373,73 @@ def analyze_image(image_path):
             0.1,
 
         "max_tokens":
-            5000,
+            3500
     }
 
-    response = requests.post(
+    headers = {
 
-        OPENROUTER_URL,
+        "Authorization":
+            f"Bearer {OPENROUTER_API_KEY}",
 
-        headers=headers,
+        "Content-Type":
+            "application/json",
 
-        json=payload,
+        "HTTP-Referer":
+            "http://localhost",
 
-        timeout=120
-    )
+        "X-Title":
+            "Garment Pattern Intelligence System"
+    }
+
+    try:
+
+        response = requests.post(
+            OPENROUTER_URL,
+            headers=headers,
+            json=payload,
+            timeout=(20, 100)
+        )
+
+    except requests.exceptions.Timeout:
+
+        raise RuntimeError(
+            "AI response timeout ho gaya."
+        )
+
+    except requests.exceptions.RequestException as e:
+
+        raise RuntimeError(
+            f"OpenRouter connection error:\n{e}"
+        )
 
     if response.status_code != 200:
 
         raise RuntimeError(
-            f"OpenRouter HTTP {response.status_code}\n"
-            f"{response.text[:3000]}"
+            f"OpenRouter HTTP {response.status_code}\n\n"
+            + response.text[:2500]
         )
 
     data = response.json()
 
-    if "error" in data:
-
-        error = data["error"]
+    if data.get("error"):
 
         raise RuntimeError(
-            "OpenRouter Error:\n"
-            + str(error)
+            "OpenRouter error:\n"
+            + json.dumps(
+                data["error"],
+                indent=2
+            )
         )
 
     choices = data.get(
-        "choices"
+        "choices",
+        []
     )
 
     if not choices:
 
         raise RuntimeError(
-            "OpenRouter ne koi choices return nahi ki."
+            "AI response mein choices nahi mili."
         )
 
     message = choices[0].get(
@@ -523,103 +451,177 @@ def analyze_image(image_path):
         "content"
     )
 
-    # Some models can return unusual content structures
-
-    if isinstance(
-        content,
-        list
-    ):
-
-        text_parts = []
-
-        for item in content:
-
-            if isinstance(
-                item,
-                dict
-            ):
-
-                if item.get("type") == "text":
-
-                    text_parts.append(
-                        item.get(
-                            "text",
-                            ""
-                        )
-                    )
-
-        content = "".join(
-            text_parts
-        )
-
-    if content is None:
-
-        logger.error(
-            "OpenRouter response:\n%s",
-            json.dumps(
-                data,
-                indent=2,
-                ensure_ascii=False
-            )
-        )
-
-        raise RuntimeError(
-            "AI ne content return nahi kiya."
-        )
-
-    return normalize_spec(
-        extract_json(content)
+    return parse_json(
+        content
     )
 
 
 # ============================================================
-# DISPLAY FORMAT
+# NORMALIZE
 # ============================================================
 
-def format_spec_message(spec):
+def normalize_spec(
+    ai_data
+):
 
-    measurements = spec.get(
+    measurements = ai_data.get(
         "measurements",
         {}
     )
 
-    lines = [
+    if not isinstance(
+        measurements,
+        dict
+    ):
 
-        "🔍 *AI Analysis Complete*",
+        measurements = {}
 
-        "",
+    # aliases
 
-        f"👗 Garment: `{spec.get('garment_type') or 'Unknown'}`",
+    if (
+        measurements.get("length")
+        is None
+        and measurements.get(
+            "length_from_hps"
+        ) is not None
+    ):
 
-        f"📏 Unit: `{spec.get('unit') or 'Unknown'}`",
+        measurements["length"] = (
+            measurements[
+                "length_from_hps"
+            ]
+        )
 
-        f"📐 Size: `{spec.get('size') or 'Unknown'}`",
+    if (
+        measurements.get(
+            "length_from_hps"
+        ) is None
+        and measurements.get(
+            "length"
+        ) is not None
+    ):
 
-        "",
+        measurements[
+            "length_from_hps"
+        ] = measurements[
+            "length"
+        ]
 
-        "*Measurements:*",
-    ]
+    if (
+        measurements.get(
+            "sleeve_length"
+        ) is None
+        and measurements.get(
+            "sleeve_length_from_neck_seam"
+        ) is not None
+    ):
+
+        measurements[
+            "sleeve_length"
+        ] = measurements[
+            "sleeve_length_from_neck_seam"
+        ]
+
+    spec = {
+
+        "garment_type":
+            ai_data.get(
+                "garment_type"
+            ),
+
+        "size":
+            ai_data.get(
+                "size"
+            ),
+
+        "unit":
+            ai_data.get(
+                "unit"
+            ),
+
+        "measurements":
+            measurements,
+
+        "style_details":
+            ai_data.get(
+                "style_details",
+                []
+            ),
+
+        "construction_details":
+            ai_data.get(
+                "construction_details",
+                []
+            ),
+
+        "special_details":
+            ai_data.get(
+                "special_details",
+                []
+            )
+    }
+
+    # Flatten measurements for generator
 
     for key, value in measurements.items():
 
-        if value is not None:
+        spec[key] = value
 
-            readable = key.replace(
-                "_",
-                " "
-            ).title()
-
-            lines.append(
-                f"• {readable}: `{value}`"
-            )
-
-    return "\n".join(
-        lines
-    )
+    return spec
 
 
 # ============================================================
-# START COMMAND
+# SAVE DXF REFERENCE
+# ============================================================
+
+async def save_reference_dxf(
+    update,
+    document
+):
+
+    file_id = document.file_id
+
+    original_name = (
+        document.file_name
+        or "reference.dxf"
+    )
+
+    safe_name = (
+        uuid.uuid4().hex[:10]
+        + "_"
+        + original_name.replace(
+            " ",
+            "_"
+        )
+    )
+
+    output_path = (
+        ORIGINAL_DXF_DIR /
+        safe_name
+    )
+
+    telegram_file = (
+        await context_bot.get_file(
+            file_id
+        )
+    )
+
+    await telegram_file.download_to_drive(
+        str(output_path)
+    )
+
+    return output_path
+
+
+# ============================================================
+# GLOBAL BOT CONTEXT
+# ============================================================
+
+context_bot = None
+
+
+# ============================================================
+# START
 # ============================================================
 
 async def start(
@@ -629,51 +631,103 @@ async def start(
 
     await update.message.reply_text(
 
-        "👗 *Garment AI Pattern Manager Active!*\n\n"
+        "👗 *Garment Pattern Intelligence System*\n\n"
 
-        "📸 Management/specification sheet bhejiye.\n\n"
+        "Main 2 tarah se kaam kar sakta hoon:\n\n"
 
-        "AI sheet ko analyze karega:\n"
+        "📐 *1. Existing Pattern*\n"
+        "DXF file bhejo → system reference ke रूप में save karega.\n\n"
 
-        "1️⃣ Garment type\n"
-        "2️⃣ Size\n"
-        "3️⃣ Measurements\n"
-        "4️⃣ Style details\n"
-        "5️⃣ Construction details\n\n"
+        "🆕 *2. New Pattern*\n"
+        "Management sheet bhejo → AI garment analyze karega → "
+        "pattern pieces plan karega → preview + DXF generate karega.\n\n"
 
-        "Uske baad pattern engine DXF + technical preview generate karega.",
+        "⚠️ Clear management sheet bhejna best result ke liye zaroori hai.",
 
         parse_mode="Markdown"
     )
 
 
 # ============================================================
-# HELP
+# DXF HANDLER
 # ============================================================
 
-async def help_command(
+async def handle_dxf(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
 
-    await update.message.reply_text(
+    document = update.message.document
 
-        "📖 *Garment AI Help*\n\n"
+    if not document:
+        return
 
-        "Management/spec sheet ki clear photo bhejiye.\n\n"
-
-        "Best result ke liye:\n"
-        "• Image clear ho\n"
-        "• Measurements readable hon\n"
-        "• Unit visible ho\n"
-        "• Sheet crop na ho\n\n"
-
-        "Output:\n"
-        "📐 Technical preview\n"
-        "📎 DXF pattern",
-
-        parse_mode="Markdown"
+    filename = (
+        document.file_name
+        or "pattern.dxf"
     )
+
+    if not filename.lower().endswith(
+        ".dxf"
+    ):
+
+        await update.message.reply_text(
+            "❌ Sirf DXF file bhejiye."
+        )
+
+        return
+
+    status = await update.message.reply_text(
+        "📐 DXF receive ho gaya.\n"
+        "💾 Original pattern safely save ho raha hai..."
+    )
+
+    try:
+
+        file = await document.get_file()
+
+        safe_name = (
+            uuid.uuid4().hex[:10]
+            + "_"
+            + filename.replace(
+                " ",
+                "_"
+            )
+        )
+
+        path = (
+            ORIGINAL_DXF_DIR /
+            safe_name
+        )
+
+        await file.download_to_drive(
+            str(path)
+        )
+
+        await status.edit_text(
+
+            "✅ *Original DXF saved!*\n\n"
+
+            f"📁 File: `{filename}`\n"
+            f"💾 Reference ID: `{safe_name[:10]}`\n\n"
+
+            "Ab jab related management sheet bhejoge, "
+            "system is reference ko future pattern workflow "
+            "mein use kar sakta hai.",
+
+            parse_mode="Markdown"
+        )
+
+    except Exception as e:
+
+        logger.exception(
+            "DXF save failed"
+        )
+
+        await status.edit_text(
+            "❌ DXF save error:\n"
+            + str(e)[:2000]
+        )
 
 
 # ============================================================
@@ -687,32 +741,32 @@ async def handle_photo(
 
     status = await update.message.reply_text(
 
-        "📸 Photo receive ho gayi.\n"
-        "🔍 AI sheet analyze kar raha hai..."
+        "📸 Management sheet receive ho gayi.\n"
+        "🔍 AI garment ko analyze kar raha hai..."
     )
 
-    job_id = uuid.uuid4().hex[:8]
+    job_id = uuid.uuid4().hex[:10]
 
     image_path = (
-        TEMP_DIR
-        / f"{job_id}.jpg"
+        TEMP_DIR /
+        f"{job_id}.jpg"
     )
 
     dxf_path = (
-        OUTPUT_DIR
-        / f"{job_id}_pattern.dxf"
+        OUTPUT_DIR /
+        f"{job_id}.dxf"
     )
 
     png_path = (
-        OUTPUT_DIR
-        / f"{job_id}_preview.png"
+        PREVIEW_DIR /
+        f"{job_id}.png"
     )
 
     try:
 
-        # ----------------------------------------------------
-        # Download image
-        # ----------------------------------------------------
+        # ====================================================
+        # DOWNLOAD
+        # ====================================================
 
         photo = await update.message.photo[
             -1
@@ -722,107 +776,101 @@ async def handle_photo(
             str(image_path)
         )
 
+        # ====================================================
+        # AI
+        # ====================================================
+
         await status.edit_text(
-            "🔍 AI Vision analysis chal raha hai..."
+
+            "🧠 *Pattern Intelligence running...*\n\n"
+            "1️⃣ Garment identify\n"
+            "2️⃣ Measurements read\n"
+            "3️⃣ Construction analyze\n"
+            "4️⃣ Pattern pieces decide",
+
+            parse_mode="Markdown"
         )
 
-        # ----------------------------------------------------
-        # AI
-        # ----------------------------------------------------
+        ai_data = await asyncio.to_thread(
 
-        spec = analyze_image(
+            analyze_management_sheet,
+
             image_path
         )
 
-        logger.info(
-            "AI SPEC: %s",
-            json.dumps(
-                spec,
-                ensure_ascii=False
-            )
+        spec = normalize_spec(
+            ai_data
         )
 
-        # ----------------------------------------------------
-        # Validation
-        # ----------------------------------------------------
+        # ====================================================
+        # PATTERN PLAN
+        # ====================================================
 
-        errors = validate_spec(
+        plan = build_pattern_plan(
             spec
         )
 
-        if errors:
-
-            await status.edit_text(
-
-                "⚠️ Sheet analyze ho gayi, "
-                "lekin pattern banane ke liye data incomplete hai.\n\n"
-
-                + "\n".join(
-                    f"• {error}"
-                    for error in errors
-                )
-
-                + "\n\n"
-                "Clear/complete specification sheet bhejiye."
-            )
-
-            return
-
-        # ----------------------------------------------------
-        # Show extracted data
-        # ----------------------------------------------------
+        pieces = plan.get(
+            "pieces",
+            []
+        )
 
         await status.edit_text(
 
-            format_spec_message(
-                spec
-            )
+            "🧠 *Pattern plan ready*\n\n"
 
-            + "\n\n"
-            "⚙️ Pattern engine drafting start kar raha hai..."
+            f"👗 Garment: `{spec.get('garment_type')}`\n"
+            f"📐 Size: `{spec.get('size') or 'N/A'}`\n"
+            f"📏 Unit: `{spec.get('unit') or 'N/A'}`\n\n"
+
+            "*Pattern Pieces:*\n"
+            +
+            "\n".join(
+                f"• {piece}"
+                for piece in pieces
+            )
+            +
+            "\n\n"
+            "⚙️ Geometry drafting start ho rahi hai...",
+
+            parse_mode="Markdown"
         )
 
-        # ----------------------------------------------------
-        # Generate pattern
-        # ----------------------------------------------------
+        # ====================================================
+        # GENERATE
+        # ====================================================
 
-        dxf_out, png_out = (
-            generate_technical_draft_and_dxf(
+        dxf_out, png_out = await asyncio.to_thread(
 
-                spec,
+            generate_technical_draft_and_dxf,
 
-                str(dxf_path),
+            spec,
 
-                str(png_path)
-            )
+            str(dxf_path),
+
+            str(png_path)
         )
 
-        # ----------------------------------------------------
-        # Caption
-        # ----------------------------------------------------
+        # ====================================================
+        # PREVIEW
+        # ====================================================
+
+        await status.delete()
 
         caption = (
 
-            "🎉 *Garment Pattern Draft Ready!*\n\n"
+            "🎉 *Technical Pattern Preview Ready!*\n\n"
 
-            f"👗 Garment: `{spec.get('garment_type')}`\n"
-
+            f"👗 `{spec.get('garment_type')}`\n"
             f"📐 Size: `{spec.get('size') or 'N/A'}`\n"
+            f"📏 Unit: `{spec.get('unit') or 'N/A'}`\n\n"
 
-            f"📏 Unit: `{spec.get('unit')}`\n\n"
-
-            "✅ Technical preview generated\n"
-            "✅ DXF generated\n"
-            "✅ Grainline included\n"
-            "✅ Seam allowance included\n"
-            "✅ Pattern pieces separated"
+            "Pattern pieces:\n"
+            +
+            ", ".join(
+                pieces
+            )
         )
-
-        # ----------------------------------------------------
-        # Send preview
-        # ----------------------------------------------------
-
-        await status.delete()
 
         with open(
             png_out,
@@ -838,9 +886,9 @@ async def handle_photo(
                 parse_mode="Markdown"
             )
 
-        # ----------------------------------------------------
-        # Send DXF
-        # ----------------------------------------------------
+        # ====================================================
+        # DXF
+        # ====================================================
 
         garment_name = (
             str(
@@ -867,44 +915,49 @@ async def handle_photo(
         )
 
         filename = (
-            f"{size}_{garment_name}.dxf"
+            f"{size}_{garment_name}_{job_id}.dxf"
         )
 
         with open(
             dxf_out,
             "rb"
-        ) as dxf_file:
+        ) as dxf:
 
             await update.message.reply_document(
 
-                document=dxf_file,
+                document=dxf,
 
                 filename=filename,
 
                 caption=(
-                    "📐 DXF pattern attached.\n"
-                    "Production use se pehle "
-                    "pattern technician se fit/check karna recommended hai."
-                )
+                    "📐 *DXF Pattern Generated*\n\n"
+                    "⚠️ Production cutting se pehle "
+                    "pattern technician se measurement, "
+                    "fit aur seam allowance verify karein."
+                ),
+
+                parse_mode="Markdown"
             )
 
-        # ----------------------------------------------------
-        # Success
-        # ----------------------------------------------------
+        # ====================================================
+        # SUMMARY
+        # ====================================================
 
         await update.message.reply_text(
 
-            "✅ *Complete!*\n\n"
+            "✅ *WORKFLOW COMPLETE*\n\n"
 
-            "Management Sheet\n"
+            "📸 Management Sheet\n"
             "↓\n"
-            "AI Vision\n"
+            "🧠 AI Vision\n"
             "↓\n"
-            "Measurements\n"
+            "📋 Pattern Planning\n"
             "↓\n"
-            "Pattern Engine\n"
+            "📐 Geometry Engine\n"
             "↓\n"
-            "DXF + Preview",
+            "🖼️ Technical Preview\n"
+            "↓\n"
+            "📎 DXF",
 
             parse_mode="Markdown"
         )
@@ -919,11 +972,8 @@ async def handle_photo(
 
             await status.edit_text(
 
-                "❌ *Process failed*\n\n"
-
-                f"`{str(e)[:3000]}`\n\n"
-
-                "Please sheet dobara bhejiye.",
+                "❌ *Pattern generation failed*\n\n"
+                f"`{str(e)[:3000]}`",
 
                 parse_mode="Markdown"
             )
@@ -931,29 +981,20 @@ async def handle_photo(
         except Exception:
 
             await update.message.reply_text(
-
                 "❌ Error:\n"
                 + str(e)[:3000]
             )
 
     finally:
 
-        # ----------------------------------------------------
-        # Cleanup temporary files
-        # ----------------------------------------------------
+        try:
 
-        for path in [
-            image_path
-        ]:
+            if image_path.exists():
 
-            try:
+                image_path.unlink()
 
-                if path.exists():
-
-                    path.unlink()
-
-            except Exception:
-                pass
+        except Exception:
+            pass
 
 
 # ============================================================
@@ -962,24 +1003,70 @@ async def handle_photo(
 
 def main():
 
-    # --------------------------------------------------------
-    # Environment validation
-    # --------------------------------------------------------
+    global context_bot
 
     if not TELEGRAM_BOT_TOKEN:
 
-        logger.error(
-            "TELEGRAM_BOT_TOKEN missing in .env"
+        raise RuntimeError(
+            "TELEGRAM_BOT_TOKEN .env mein missing hai."
         )
-
-        return
 
     if not OPENROUTER_API_KEY:
 
-        logger.error(
-            "OPENROUTER_API_KEY missing in .env"
+        raise RuntimeError(
+            "OPENROUTER_API_KEY .env mein missing hai."
         )
 
-        return
+    request = HTTPXRequest(
 
-    # ------------------------------------------
+        connect_timeout=45,
+
+        read_timeout=120,
+
+        write_timeout=120,
+
+        pool_timeout=45
+    )
+
+    app = (
+
+        ApplicationBuilder()
+
+        .token(
+            TELEGRAM_BOT_TOKEN
+        )
+
+        .request(
+            request
+        )
+
+        .build()
+    )
+
+    context_bot = app.bot
+
+    # Commands
+
+    app.add_handler(
+        CommandHandler(
+            "start",
+            start
+        )
+    )
+
+    # DXF
+
+    app.add_handler(
+        MessageHandler(
+            filters.Document.FileExtension(
+                "dxf"
+            ),
+            handle_dxf
+        )
+    )
+
+    # Images
+
+    app.add_handler(
+        MessageHandler(
+            filters.PHOTO,
