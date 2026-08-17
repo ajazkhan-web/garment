@@ -130,6 +130,23 @@ def _draw_piece(ax, piece_data, x_off, y_off, scale):
                 ha="center", va="center", fontsize=6.5, color="gray", alpha=0.8)
 
 
+
+    # Draw slash fold lines (radiating drape lines) if present.
+    slash_lines = piece_data.get("slash_fold_lines", [])
+    if slash_lines:
+        for line in slash_lines:
+            if len(line) >= 2:
+                x0, y0 = line[0]
+                x1, y1 = line[1]
+                ax.plot([x_off + x0*scale, x_off + x1*scale],
+                        [y_off + y0*scale, y_off + y1*scale],
+                        color="#B0B0B0", lw=0.5, ls=":", zorder=3)
+        # Draw pivot point marker
+        first_line = slash_lines[0]
+        px, py = first_line[0]
+        ax.plot(x_off + px*scale, y_off + py*scale, 'o',
+                color="#666666", markersize=3, zorder=5)
+
 def _draw_title_banner(ax, md, canvas_w, canvas_h):
     from matplotlib.patches import FancyBboxPatch
     bar = FancyBboxPatch((0.3, canvas_h - 1.15), canvas_w - 0.6, 1.0,
