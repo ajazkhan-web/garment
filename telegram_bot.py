@@ -197,7 +197,7 @@ class GeminiClient:
                     raise ValueError("Gemini returned empty response.")
                 return text
         if last_error is not None:
-            raise RuntimeError(f"Gemini unavailable after 4 attempts (last: HTTP {last_error.status_code}). Try again in a minute.")
+            raise RuntimeError(f"Gemini API error (HTTP {last_error.status_code}): {last_error.text[:200]}")
         raise RuntimeError("Gemini call failed after retries.")
 
     async def analyze_measurement_sheet(self, image_bytes: bytes, mime_type: str = "image/jpeg") -> dict:
