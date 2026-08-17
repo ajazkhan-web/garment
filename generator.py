@@ -179,7 +179,7 @@ class PatternPiece:
     layer: str = '1'
 
     def to_dict(self) -> dict:
-        return {
+        d = {
             'name': self.name,
             'points': [p.to_tuple() for p in self.points],
             'curves': [
@@ -203,6 +203,10 @@ class PatternPiece:
             'cut_quantity': self.cut_quantity,
             'layer': self.layer,
         }
+        # Include slash fold lines if present (for blueprint rendering)
+        if hasattr(self, '_slash_fold_lines') and self._slash_fold_lines:
+            d['slash_fold_lines'] = self._slash_fold_lines
+        return d
 
 
 # ---------------------------------------------------------------------------
@@ -510,6 +514,12 @@ class DraftingEngine:
         """
         garment_type = garment_type.lower().strip()
         self.pieces = []
+
+        # Asymmetric cowl-drape top takes priority when both cowl and
+        # gathers are flagged — regardless of garment_type keyword.
+        if self.style.has_cowl and self.style.has_gathers:
+            self._draft_asymmetric_cowl_top()
+            return self.pieces
 
         dispatch = {
             "dress": self._draft_dress,
@@ -1205,6 +1215,455 @@ class DraftingEngine:
         return result
 
     # ---- garment type handlers ------------------------------------------------
+
+    # ---- asymmetric cowl-drape top -------------------------------------------
+
+    def draft_asymmetric_cowl_front(self) -> PatternPiece:
+        """Front bodice with slash-and-spread radiating drape.
+
+        Uses the classic slash-and-spread technique: a fitted bodice front
+        is drafted, then multiple radiating fold lines fan out from a single
+        pivot point near one shoulder toward the opposite side/hem.  Each
+        slash is spread open progressively to add fullness that becomes the
+        draped cowl fabric.
+
+        Origin at centre-front-neck (0, 0).  +x = away from CF toward side.
+        The drape cascades from the LEFT shoulder down to the RIGHT side/hem.
+        """
+        half_bust = self.quarter_bust
+        half_waist = self.quarter_waist
+
+        # ── Build fitted bodice front sloper outline ──
+        cf_neck = Point(0, 0)
+        cf_waist = Point(0, -self.back_length)
+        cf_hem = Point(0, -self.back_length - 4.0)
+
+        neck_shoulder_l = Point(-self.neck_width / 2.0, -self.neck_depth_back * 0.3)
+        shoulder_tip_l = _polar(neck_shoulder_l, -self.shoulder_slope - 180,
+                                self.half_shoulder)
+
+        neck_shoulder_r = Point(self.neck_width / 2.0, -self.neck_depth_back * 0.3)
+        shoulder_tip_r = _polar(neck_shoulder_r, -self.shoulder_slope,
+                                self.half_shoulder)
+
+        armhole_top = Point(shoulder_tip_r.x, -self.armhole_depth * 0.7)
+        side_top = Point(half_bust, -self.armhole_depth)
+        side_waist = Point(half_waist, -self.back_length)
+
+        # Lower hem — asymmetric: left side shorter, right side longer
+        hem_drop = 6.0  # extra length on the draped (right) side
+        side_hem_r = Point(half_bust + 2.0, -self.back_length - 4.0 - hem_drop)
+        side_hem_l = Point(-half_bust * 0.3, -self.back_length - 2.0)
+
+        # Neckline — deep cowl on the left side, sweeping to right shoulder
+        neckline_pts = _neckline_curve(cf_neck, neck_shoulder_r,
+                                       self.neck_depth_front * 0.8)
+
+        # Armhole
+        armhole_pts = _armhole_curve(shoulder_tip_r, side_top,
+                                     self.armhole_depth * 0.15)
+
+        # ── Slash-and-spread: radiating fold lines ──
+        # Pivot near LEFT shoulder neck point
+        pivot = Point(neck_shoulder_l.x + 1.0, neck_shoulder_l.y - 2.0)
+
+        num_slashes = 8
+        slash_lines = []  # list of (start=pivot, end=Point on outline)
+        # Fan from pivot toward right side-seam and lower-right hem
+        # Angles sweep from roughly -80° (toward waist) to -30° (toward side)
+        angle_start = -100.0
+        angle_end = -25.0
+        for i in range(num_slashes):
+            t = i / (num_slashes - 1)
+            ang = angle_start + t * (angle_end - angle_start)
+            # Length to reach the opposite edge of the bodice
+            spread_len = self.back_length * (0.6 + t * 0.5)
+            end = _polar(pivot, ang, spread_len)
+            slash_lines.append((pivot, end))
+
+        # Progressive spread amounts (cm per slash, increasing outward)
+        spread_per_slash = 2.5  # base spread
+        spreads = [spread_per_slash * (1.0 + i * 0.4) for i in range(num_slashes)]
+
+        # ── Build final outline with spread fullness ──
+        # Start from CF neck, go right along neckline to right shoulder,
+        # down armhole to side seam, down to hem (with asymmetric drop),
+        # across hem to left side, up to left shoulder, back to CF neck.
+        full_outline = [cf_neck]
+        full_outline.extend(neckline_pts[1:-1])
+        full_outline.append(neck_shoulder_r)
+        full_outline.append(shoulder_tip_r)
+        full_outline.extend(armhole_pts[1:-1])
+        full_outline.append(side_top)
+        full_outline.append(side_waist)
+        full_outline.append(side_hem_r)
+
+        # Asymmetric hem: curve from right side hem to left side hem
+        # Use a cubic bezier for a graceful draped hemline
+        hem_curve = _cubic_bezier(
+            side_hem_r,
+            Point(half_bust * 0.3, side_hem_r.y + 3.0),
+            Point(0, side_hem_l.y + 1.0),
+            side_hem_l,
+            n=16)
+        full_outline.extend(hem_curve[1:-1])
+        full_outline.append(side_hem_l)
+
+        # Left side up to left shoulder
+        left_side_waist = Point(-half_waist * 0.5, -self.back_length)
+        full_outline.append(left_side_waist)
+        full_outline.append(shoulder_tip_l)
+        full_outline.append(neck_shoulder_l)
+
+        # Back to CF neck
+        left_neckline = _neckline_curve(neck_shoulder_l, cf_neck,
+                                        self.neck_depth_front * 0.3)
+        full_outline.extend(left_neckline[1:-1])
+
+        # ── Curves for DXF ──
+        neck_curve_end = len(neckline_pts) - 1
+        arm_curve_end = neck_curve_end + len(armhole_pts)
+        hem_curve_start = arm_curve_end + 4  # after side_top, side_waist, side_hem_r
+
+        curves = [
+            {"start_idx": 0, "end_idx": neck_curve_end,
+             "control_points": [cf_neck, neck_shoulder_r], "type": "bezier"},
+            {"start_idx": neck_curve_end + 1, "end_idx": arm_curve_end,
+             "control_points": [shoulder_tip_r, side_top], "type": "bezier"},
+            {"start_idx": hem_curve_start,
+             "end_idx": hem_curve_start + len(hem_curve),
+             "control_points": [side_hem_r, side_hem_l], "type": "bezier"},
+        ]
+
+        # ── Store slash fold lines as internal reference curves ──
+        # We'll store them in a special attribute that blueprint can render
+        slash_fold_lines = []
+        for i, (s, e) in enumerate(slash_lines):
+            # Offset endpoint by the spread amount (perpendicular outward)
+            ang = _angle(s, e)
+            spread_pt = _polar(e, ang + 90, spreads[i] * 0.5)
+            slash_fold_lines.append((s.to_tuple(), spread_pt.to_tuple()))
+
+        # ── Notches ──
+        notches = []
+        if self.style.has_notches:
+            # Notch at armhole midpoint
+            notches.append(Notch(point=_midpoint(shoulder_tip_r, side_top),
+                                 depth=0.3, angle=0))
+            # Notch at gather pivot point
+            notches.append(Notch(point=pivot, depth=0.5, angle=90))
+            # Notch at bust point
+            notches.append(Notch(point=Point(self.half_apex, -self.shoulder_to_bust),
+                                depth=0.3, angle=90))
+            # Notches along the draped side seam marking gather points
+            for i in range(3):
+                t = (i + 1) / 4.0
+                nx = half_bust * (1.0 - t * 0.3)
+                ny = -self.armhole_depth + t * (self.back_length - self.armhole_depth)
+                notches.append(Notch(point=Point(nx, ny), depth=0.4, angle=180))
+
+        # ── Darts ──
+        darts = []
+        # No waist dart on the front — fullness is taken up by the drape,
+        # but add a small bust dart for shaping
+        if self.style.has_darts:
+            apex = Point(self.half_apex, -self.shoulder_to_bust)
+            dart_start = Point(side_top.x - 1.5, side_top.y - 2.0)
+            darts.append(Dart(start=dart_start, end=apex,
+                              width=self.bust_dart_intake * 0.6))
+
+        # ── Grainline ──
+        grainline = [Point(half_bust * 0.3, -2.0),
+                     Point(half_bust * 0.3, -self.back_length + 2.0)]
+
+        piece = PatternPiece(
+            name="Front Bodice (Cowl Drape)",
+            points=full_outline,
+            curves=curves,
+            darts=darts,
+            notches=notches,
+            grainline=grainline,
+            label=f"Front Bodice Cowl Drape - {self.style.size_label or 'Custom'}",
+            cut_quantity=self.style.cut_quantities.get("bodice_front", 1),
+            layer=LAYER_CUT,
+        )
+
+        # Store slash fold lines as a custom attribute for blueprint rendering
+        piece._slash_fold_lines = slash_fold_lines
+
+        return piece
+
+    def draft_two_piece_sleeve(self) -> tuple:
+        """Draft a two-piece tailored long sleeve.
+
+        Returns (sleeve_front, sleeve_back) — two separate PatternPiece
+        objects that seam together along inner (underarm) and outer (elbow)
+        seams.
+
+        Origin at sleeve cap top (0, 0).  +y = downward.
+        Front panel: shallower/wider cap, single notch at cap.
+        Back panel: deeper/narrower cap, double notch at cap.
+        """
+        sleeve_len = self.m.sleeve_length if self.m.sleeve_length > 0 else 58.0
+        half_bicep = self.bicep / 2.0
+        half_wrist = self.wrist / 2.0
+
+        # Two-piece sleeve: split at inner (underarm) and outer (elbow) seams
+        # Front panel is slightly narrower at bicep, back panel slightly wider
+        front_bicep_half = half_bicep * 0.45
+        back_bicep_half = half_bicep * 0.55
+        front_wrist_half = half_wrist * 0.45
+        back_wrist_half = half_wrist * 0.55
+
+        # Cap heights — front cap is shallower, back cap is deeper
+        front_cap_h = self.bicep / 3.5 + 2.0
+        back_cap_h = self.bicep / 3.0 + 3.5
+
+        # ── Front sleeve panel ──
+        # Cap top is shared centerline point
+        cap_top_f = Point(0, 0)
+        cap_outer_f = Point(front_bicep_half, -front_cap_h * 0.7)
+        cap_inner_f = Point(-back_bicep_half * 0.3, -front_cap_h * 0.5)
+
+        # Outer seam (elbow side) — slight inward curve at elbow
+        elbow_y = -sleeve_len * 0.5
+        wrist_outer_f = Point(front_wrist_half, -sleeve_len)
+        elbow_outer_f = Point(front_bicep_half * 0.85, elbow_y)
+
+        # Inner seam (underarm side)
+        wrist_inner_f = Point(-back_wrist_half * 0.3, -sleeve_len)
+        elbow_inner_f = Point(-back_bicep_half * 0.25, elbow_y)
+
+        # Front cap curve (shallower)
+        ctrl1_f = Point(front_bicep_half * 0.5, -front_cap_h * 0.2)
+        ctrl2_f = Point(front_bicep_half * 0.8, -front_cap_h * 0.6)
+        cap_curve_f = _cubic_bezier(cap_top_f, ctrl1_f, ctrl2_f, cap_outer_f, n=20)
+
+        # Inner cap curve
+        ctrl1i_f = Point(-back_bicep_half * 0.15, -front_cap_h * 0.15)
+        ctrl2i_f = Point(-back_bicep_half * 0.25, -front_cap_h * 0.4)
+        cap_inner_curve_f = _cubic_bezier(cap_top_f, ctrl1i_f, ctrl2i_f, cap_inner_f, n=16)
+
+        # Outer seam curve (slight elbow bend)
+        outer_seam_f = _quadratic_bezier(cap_outer_f, elbow_outer_f, wrist_outer_f, n=12)
+
+        # Inner seam (relatively straight)
+        inner_seam_f = _quadratic_bezier(cap_inner_f, elbow_inner_f, wrist_inner_f, n=10)
+
+        # Wrist line
+        wrist_pts_f = _quadratic_bezier(wrist_outer_f,
+                                        Point(0, -sleeve_len + 0.5),
+                                        wrist_inner_f, n=8)
+
+        # Assemble front outline
+        front_outline = [cap_top_f]
+        front_outline.extend(cap_curve_f[1:-1])
+        front_outline.append(cap_outer_f)
+        front_outline.extend(outer_seam_f[1:-1])
+        front_outline.append(wrist_outer_f)
+        front_outline.extend(wrist_pts_f[1:-1])
+        front_outline.append(wrist_inner_f)
+        front_outline.extend(list(reversed(inner_seam_f))[1:-1])
+        front_outline.append(cap_inner_f)
+        front_outline.extend(list(reversed(cap_inner_curve_f))[1:-1])
+
+        # Front curves
+        f_cap_end = len(cap_curve_f)
+        f_outer_end = f_cap_end + len(outer_seam_f)
+        f_wrist_end = f_outer_end + len(wrist_pts_f)
+        f_inner_end = f_wrist_end + len(inner_seam_f)
+
+        front_curves = [
+            {"start_idx": 0, "end_idx": f_cap_end,
+             "control_points": [cap_top_f, ctrl1_f, ctrl2_f, cap_outer_f],
+             "type": "bezier"},
+            {"start_idx": f_cap_end, "end_idx": f_outer_end,
+             "control_points": [cap_outer_f, elbow_outer_f, wrist_outer_f],
+             "type": "bezier"},
+            {"start_idx": f_outer_end, "end_idx": f_wrist_end,
+             "control_points": [wrist_outer_f, wrist_inner_f],
+             "type": "bezier"},
+        ]
+
+        # Front notches — single notch at cap (front convention)
+        front_notches = []
+        if self.style.has_notches:
+            cap_mid_f = cap_curve_f[len(cap_curve_f) // 2]
+            front_notches.append(Notch(point=cap_mid_f, depth=0.3, angle=90))
+            # Elbow notch on outer seam
+            front_notches.append(Notch(point=elbow_outer_f, depth=0.3, angle=0))
+            # Wrist notch
+            front_notches.append(Notch(point=Point(0, -sleeve_len), depth=0.3, angle=90))
+
+        front_grainline = [Point(0, -front_cap_h), Point(0, -sleeve_len + 1.0)]
+
+        sleeve_front = PatternPiece(
+            name="Long Sleeve Front",
+            points=front_outline,
+            curves=front_curves,
+            darts=[],
+            notches=front_notches,
+            grainline=front_grainline,
+            label=f"Long Sleeve Front - {self.style.size_label or 'Custom'}",
+            cut_quantity=self.style.cut_quantities.get("sleeve_front", 1),
+            layer=LAYER_CUT,
+        )
+
+        # ── Back sleeve panel ──
+        cap_top_b = Point(0, 0)
+        cap_outer_b = Point(back_bicep_half, -back_cap_h * 0.7)
+        cap_inner_b = Point(-front_bicep_half * 0.3, -back_cap_h * 0.5)
+
+        wrist_outer_b = Point(back_wrist_half, -sleeve_len)
+        wrist_inner_b = Point(-front_wrist_half * 0.3, -sleeve_len)
+        elbow_outer_b = Point(back_bicep_half * 0.88, elbow_y)
+        elbow_inner_b = Point(-front_bicep_half * 0.25, elbow_y)
+
+        # Back cap curve (deeper)
+        ctrl1_b = Point(back_bicep_half * 0.5, -back_cap_h * 0.2)
+        ctrl2_b = Point(back_bicep_half * 0.8, -back_cap_h * 0.65)
+        cap_curve_b = _cubic_bezier(cap_top_b, ctrl1_b, ctrl2_b, cap_outer_b, n=20)
+
+        # Inner cap curve
+        ctrl1i_b = Point(-front_bicep_half * 0.15, -back_cap_h * 0.15)
+        ctrl2i_b = Point(-front_bicep_half * 0.25, -back_cap_h * 0.4)
+        cap_inner_curve_b = _cubic_bezier(cap_top_b, ctrl1i_b, ctrl2i_b, cap_inner_b, n=16)
+
+        # Outer seam with elbow bend (more pronounced on back)
+        outer_seam_b = _quadratic_bezier(cap_outer_b, elbow_outer_b, wrist_outer_b, n=12)
+        inner_seam_b = _quadratic_bezier(cap_inner_b, elbow_inner_b, wrist_inner_b, n=10)
+        wrist_pts_b = _quadratic_bezier(wrist_outer_b,
+                                         Point(0, -sleeve_len + 0.5),
+                                         wrist_inner_b, n=8)
+
+        back_outline = [cap_top_b]
+        back_outline.extend(cap_curve_b[1:-1])
+        back_outline.append(cap_outer_b)
+        back_outline.extend(outer_seam_b[1:-1])
+        back_outline.append(wrist_outer_b)
+        back_outline.extend(wrist_pts_b[1:-1])
+        back_outline.append(wrist_inner_b)
+        back_outline.extend(list(reversed(inner_seam_b))[1:-1])
+        back_outline.append(cap_inner_b)
+        back_outline.extend(list(reversed(cap_inner_curve_b))[1:-1])
+
+        b_cap_end = len(cap_curve_b)
+        b_outer_end = b_cap_end + len(outer_seam_b)
+        b_wrist_end = b_outer_end + len(wrist_pts_b)
+        b_inner_end = b_wrist_end + len(inner_seam_b)
+
+        back_curves = [
+            {"start_idx": 0, "end_idx": b_cap_end,
+             "control_points": [cap_top_b, ctrl1_b, ctrl2_b, cap_outer_b],
+             "type": "bezier"},
+            {"start_idx": b_cap_end, "end_idx": b_outer_end,
+             "control_points": [cap_outer_b, elbow_outer_b, wrist_outer_b],
+             "type": "bezier"},
+            {"start_idx": b_outer_end, "end_idx": b_wrist_end,
+             "control_points": [wrist_outer_b, wrist_inner_b],
+             "type": "bezier"},
+        ]
+
+        # Back notches — double notch at cap (back convention)
+        back_notches = []
+        if self.style.has_notches:
+            cap_mid_b = cap_curve_b[len(cap_curve_b) // 2]
+            # Double notch: two notches close together
+            back_notches.append(Notch(point=cap_mid_b, depth=0.3, angle=90))
+            if len(cap_curve_b) > 4:
+                cap_mid2_b = cap_curve_b[len(cap_curve_b) // 2 + 2]
+                back_notches.append(Notch(point=cap_mid2_b, depth=0.3, angle=90))
+            back_notches.append(Notch(point=elbow_outer_b, depth=0.3, angle=0))
+            back_notches.append(Notch(point=Point(0, -sleeve_len), depth=0.3, angle=90))
+
+        back_grainline = [Point(0, -back_cap_h), Point(0, -sleeve_len + 1.0)]
+
+        sleeve_back = PatternPiece(
+            name="Long Sleeve Back",
+            points=back_outline,
+            curves=back_curves,
+            darts=[],
+            notches=back_notches,
+            grainline=back_grainline,
+            label=f"Long Sleeve Back - {self.style.size_label or 'Custom'}",
+            cut_quantity=self.style.cut_quantities.get("sleeve_back", 1),
+            layer=LAYER_CUT,
+        )
+
+        return (sleeve_front, sleeve_back)
+
+    def draft_neck_shoulder_gather_detail(self) -> PatternPiece:
+        """Small stay/facing piece at the neck-shoulder gather point.
+
+        A narrow curved strip following the neckline-to-shoulder edge on
+        the draped side, used as a stay where the gathered drape fabric
+        is anchored.
+        """
+        strip_width = 4.0  # cm
+        neck_pt = Point(-self.neck_width / 2.0, -self.neck_depth_back * 0.3)
+        shoulder_pt = _polar(neck_pt, -self.shoulder_slope - 180,
+                             self.half_shoulder)
+
+        # Inner edge follows neckline-to-shoulder
+        inner_curve = _neckline_curve(neck_pt, shoulder_pt,
+                                       self.neck_depth_front * 0.3)
+
+        # Outer edge offset by strip_width (perpendicular outward)
+        outer_curve = []
+        for pt in inner_curve:
+            # Offset perpendicular to the direction of travel
+            if len(outer_curve) == 0:
+                outer_curve.append(_perp_point(neck_pt, shoulder_pt, strip_width))
+            else:
+                prev = inner_curve[max(0, len(outer_curve) - 1)]
+                outer_curve.append(_perp_point(prev, pt, strip_width))
+
+        # Assemble: inner curve forward, then outer curve reversed
+        outline = list(inner_curve)
+        outline.extend(reversed(outer_curve))
+
+        # Notches at gather concentration points
+        notches = []
+        if self.style.has_notches:
+            for i in range(3):
+                t = (i + 1) / 4.0
+                idx = int(t * len(inner_curve))
+                if idx < len(inner_curve):
+                    notches.append(Notch(point=inner_curve[idx],
+                                         depth=0.4, angle=90))
+
+        # Grainline along the strip
+        mid = _midpoint(neck_pt, shoulder_pt)
+        grainline = [_polar(mid, _angle(neck_pt, shoulder_pt) + 90, 1.0),
+                     _polar(mid, _angle(neck_pt, shoulder_pt) + 90, strip_width - 1.0)]
+
+        piece = PatternPiece(
+            name="Neck & Shoulder Gather Detail",
+            points=outline,
+            curves=[{"start_idx": 0, "end_idx": len(inner_curve),
+                     "control_points": [neck_pt, shoulder_pt], "type": "bezier"}],
+            darts=[],
+            notches=notches,
+            grainline=grainline,
+            label=f"Neck Shoulder Gather Stay - {self.style.size_label or 'Custom'}",
+            cut_quantity=self.style.cut_quantities.get("gather_detail", 1),
+            layer=LAYER_CUT,
+        )
+
+        return piece
+
+    def _draft_asymmetric_cowl_top(self):
+        """Draft the full asymmetric cowl-drape top.
+
+        Pieces: Front Bodice (Cowl Drape), Back Bodice, Long Sleeve Front,
+        Long Sleeve Back, Neck & Shoulder Gather Detail.
+        """
+        self.pieces.append(self.draft_asymmetric_cowl_front())
+        self.pieces.append(self.draft_bodice_back())
+        sleeve_front, sleeve_back = self.draft_two_piece_sleeve()
+        self.pieces.append(sleeve_front)
+        self.pieces.append(sleeve_back)
+        self.pieces.append(self.draft_neck_shoulder_gather_detail())
 
     def _draft_bodice(self):
         """Draft a basic bodice block (front + back)."""
