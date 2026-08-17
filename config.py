@@ -42,6 +42,14 @@ GEMINI_VISION_MODEL = "gemini-flash-latest"
 # read measurement tables, identify garment types, and reason about style.
 GEMINI_THINKING_BUDGET = 256
 
+# ── OpenRouter fallback ──
+# Used when Gemini quota is exhausted (429) or unavailable (503).
+# Standing instruction: use OpenRouter for multimodal extraction.
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "google/gemma-3-27b-it")
+OPENROUTER_MAX_TOKENS = 2000
+OPENROUTER_THINKING_BUDGET = 256
+
 # Strict: Gemini is the sole AI provider. No fallback.
 DEFAULT_AI_PROVIDER = "gemini"
 
