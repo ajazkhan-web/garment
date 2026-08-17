@@ -315,15 +315,25 @@ class GeminiClient:
         ]
 
         # Retry if critical fields come back zero
+        gemini_failed = False  # track so we don't waste time retrying a dead Gemini
         for attempt in range(3):
-            try:
-                content = await self._call(system_prompt, user_parts)
-            except RuntimeError as gemini_err:
-                if self.or_api_key:
-                    logger.warning(f"Gemini failed ({str(gemini_err)[:80]}), falling back to OpenRouter...")
-                    content = await self._call_openrouter(system_prompt, user_parts)
-                else:
-                    raise
+            content = None
+            if not gemini_failed:
+                try:
+                    content = await self._call(system_prompt, user_parts)
+                except Exception as gemini_err:
+                    logger.warning(f"Gemini failed ({str(gemini_err)[:100]})")
+                    gemini_failed = True
+                    if not self.or_api_key:
+                        logger.error("No OpenRouter fallback key configured!")
+                        raise RuntimeError(
+                            "Gemini API unavailable (quota exhausted) and no OpenRouter fallback configured. "
+                            "Set OPENROUTER_API_KEY on Render."
+                        )
+            if content is None:
+                # Gemini failed or already failed on a previous attempt — use OpenRouter
+                logger.warning(f"Falling back to OpenRouter (attempt {attempt+1})...")
+                content = await self._call_openrouter(system_prompt, user_parts)
             raw = content
             content = self._strip_fences(content)
             try:
@@ -614,7 +624,17 @@ class PatternBot:
         try:
             result = await self.ai.analyze_measurement_sheet(img_bytes, "image/jpeg")
         except Exception as e:
-            await self.tg_send(chat_id, f"❌ Analysis failed: {e}\n\nTry a clearer, well-lit photo of the sheet.")
+            err_msg = str(e)
+            if "429" in err_msg or "quota" in err_msg.lower():
+                await self.tg_send(chat_id,
+                    "❌ Analysis failed: All AI providers are over quota.\n\n"
+                    "This is a temporary issue — Gemini's free tier resets daily.\n"
+                    "Try again in a few hours, or ask the admin to add credits.")
+            elif "OpenRouter" in err_msg or "fallback" in err_msg:
+                await self.tg_send(chat_id,
+                    f"❌ Analysis failed: {err_msg[:200]}")
+            else:
+                await self.tg_send(chat_id, f"❌ Analysis failed: {err_msg[:200]}\n\nTry a clearer, well-lit photo of the sheet.")
             return
 
         # Apply to session
