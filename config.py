@@ -50,6 +50,12 @@ OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "google/gemma-3-27b-it")
 OPENROUTER_MAX_TOKENS = 2000
 OPENROUTER_THINKING_BUDGET = 256
 
+# ── Hugging Face fallback (third tier) ──
+# Used when both Gemini and OpenRouter fail.
+HF_API_KEY = os.environ.get("HF_API_KEY", "")
+HF_MODEL = os.environ.get("HF_MODEL", "google/gemma-3-27b-it")
+HF_MAX_TOKENS = 2000
+
 # Strict: Gemini is the sole AI provider. No fallback.
 DEFAULT_AI_PROVIDER = "gemini"
 
