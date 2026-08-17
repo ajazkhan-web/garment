@@ -160,8 +160,26 @@ class GeminiClient:
         repair += "}" * max(0, opens - closes)
         return repair
 
+    def _all_gemini_keys(self) -> list:
+        """Return all available Gemini API keys (normalized)."""
+        import os as _os
+        keys = []
+        for name in ("GOOGLE_API_KEY_3", "GOOGLE_API_KEY_2_2", "GOOGLE_API_KEY_2", "GOOGLE_API_KEY"):
+            raw = _os.environ.get(name, "")
+            if not raw:
+                continue
+            k = raw if raw.startswith(("AIza", "AQ.")) else "AQ." + raw
+            if k not in keys:
+                keys.append(k)
+        return keys
+
     async def _call(self, system_prompt: str, user_parts: list) -> str:
-        """Call Gemini generateContent API. Retries on 429/502/503 with backoff."""
+        """Call Gemini generateContent API with multi-key failover.
+
+        - 429 (quota): immediately try next key, no retry on same key
+        - 503 (transient): retry up to 2 times with short backoff
+        - 403: skip that key (API disabled)
+        """
         payload = {
             "contents": [{
                 "role": "user",
@@ -173,37 +191,49 @@ class GeminiClient:
                 "thinkingConfig": {"thinkingBudget": config.GEMINI_THINKING_BUDGET},
             },
         }
-        url = f"{self.base_url}?key={self.api_key}"
+        keys = self._all_gemini_keys()
         last_error = None
-        for attempt in range(4):
-            if attempt > 0:
-                wait = min(5 * (2 ** (attempt - 1)), 30)
-                logger.info(f"Gemini retry {attempt+1}/4 — waiting {wait}s...")
-                await asyncio.sleep(wait)
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                resp = await client.post(url, json=payload, headers={"Content-Type": "application/json"})
-                if resp.status_code == 403:
-                    logger.error(f"Gemini 403: {resp.text[:300]}")
-                    raise RuntimeError("Google API key rejected (403). Enable Generative Language API in Google Cloud Console.")
-                if resp.status_code in (429, 502, 503):
-                    logger.warning(f"Gemini HTTP {resp.status_code} (attempt {attempt+1}/4): {resp.text[:200]}")
-                    last_error = resp
-                    continue
-                if resp.status_code >= 400:
-                    logger.error(f"Gemini HTTP {resp.status_code}: {resp.text[:500]}")
-                resp.raise_for_status()
-                data = resp.json()
-                candidates = data.get("candidates", [])
-                if not candidates:
-                    raise ValueError("Gemini returned no candidates. Image may be unclear or too large.")
-                parts = candidates[0].get("content", {}).get("parts", [])
-                text = "".join(p.get("text", "") for p in parts)
-                if not text:
-                    raise ValueError("Gemini returned empty response.")
-                return text
+        for ki, api_key in enumerate(keys):
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent?key={api_key}"
+            for attempt in range(2):  # max 2 retries per key (only for 503)
+                if attempt > 0:
+                    await asyncio.sleep(3)
+                    logger.info(f"Gemini retry {attempt+1}/2 — key {ki+1}/{len(keys)}")
+                async with httpx.AsyncClient(timeout=self.timeout) as client:
+                    resp = await client.post(url, json=payload, headers={"Content-Type": "application/json"})
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        candidates = data.get("candidates", [])
+                        if not candidates:
+                            raise ValueError("Gemini returned no candidates.")
+                        parts = candidates[0].get("content", {}).get("parts", [])
+                        text = "".join(p.get("text", "") for p in parts)
+                        if not text:
+                            raise ValueError("Gemini returned empty response.")
+                        logger.info(f"✅ Gemini succeeded (key {ki+1}/{len(keys)}, attempt {attempt+1})")
+                        return text
+                    if resp.status_code == 429:
+                        logger.warning(f"Gemini 429 quota (key {ki+1}/{len(keys)}) — trying next key...")
+                        last_error = resp
+                        break  # don't retry 429, try next key
+                    if resp.status_code == 403:
+                        logger.warning(f"Gemini 403 (key {ki+1}/{len(keys)}) — API disabled, skipping key")
+                        last_error = resp
+                        break
+                    if resp.status_code in (502, 503):
+                        logger.warning(f"Gemini {resp.status_code} (key {ki+1}/{len(keys)}, attempt {attempt+1}/2)")
+                        last_error = resp
+                        continue
+                    if resp.status_code == 400:
+                        logger.warning(f"Gemini 400 invalid key (key {ki+1}/{len(keys)}) — skipping")
+                        last_error = resp
+                        break  # skip to next key
+                    # Other errors
+                    logger.error(f"Gemini HTTP {resp.status_code}: {resp.text[:300]}")
+                    raise RuntimeError(f"Gemini HTTP {resp.status_code}: {resp.text[:200]}")
         if last_error is not None:
-            raise RuntimeError(f"Gemini API error (HTTP {last_error.status_code}): {last_error.text[:200]}")
-        raise RuntimeError("Gemini call failed after retries.")
+            raise RuntimeError(f"Gemini {last_error.status_code}")
+        raise RuntimeError("Gemini: no API keys configured")
 
     async def _call_openrouter(self, system_prompt: str, user_parts: list) -> str:
         """Fallback: call OpenRouter chat completions API with vision support.
