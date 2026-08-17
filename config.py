@@ -33,10 +33,10 @@ for _k in _KEY_CANDIDATES:
         GOOGLE_API_KEY = _normalize_google_key(_k)
         break
 
-# gemini-3.5-flash is the current available model (Aug 2026).
-# gemini-flash-latest gets 503 under load; 3.5-flash is stable.
-GEMINI_MODEL = "gemini-3.5-flash"
-GEMINI_VISION_MODEL = "gemini-3.5-flash"
+# gemini-flash-latest is the current available model (Aug 2026).
+# gemini-3.5-flash hits 429 quota exhaustion; flash-latest has working quota.
+GEMINI_MODEL = "gemini-flash-latest"
+GEMINI_VISION_MODEL = "gemini-flash-latest"
 
 # Reasoning budget: 256 tokens gives the model enough room to accurately
 # read measurement tables, identify garment types, and reason about style.
