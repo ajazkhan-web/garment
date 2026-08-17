@@ -123,8 +123,13 @@ class GeminiClient:
         self.model = config.GEMINI_MODEL
         self.base_url = f"{GEMINI_BASE_URL}/{self.model}:generateContent"
         self.timeout = 120.0
-        logger.info(f"AI Provider: Google Gemini (sole engine, no fallback)")
-        logger.info(f"   Model: {self.model}")
+        self.or_api_key = config.OPENROUTER_API_KEY
+        self.or_model = config.OPENROUTER_MODEL
+        self.or_base_url = "https://openrouter.ai/api/v1/chat/completions"
+        has_fallback = bool(self.or_api_key)
+        logger.info(f"AI Provider: Google Gemini {'+ OpenRouter fallback' if has_fallback else '(no fallback)'}")
+        logger.info(f"   Gemini:  {self.model}")
+        logger.info(f"   OR:      {self.or_model}" if has_fallback else "   OR:      (not configured)")
         logger.info(f"   API Key: {self.api_key[:15]}...{self.api_key[-4:]}")
 
     def _strip_fences(self, text: str) -> str:
@@ -200,6 +205,69 @@ class GeminiClient:
             raise RuntimeError(f"Gemini API error (HTTP {last_error.status_code}): {last_error.text[:200]}")
         raise RuntimeError("Gemini call failed after retries.")
 
+    async def _call_openrouter(self, system_prompt: str, user_parts: list) -> str:
+        """Fallback: call OpenRouter chat completions API with vision support.
+
+        Converts Gemini-style inline_data parts to OpenRouter image_url format.
+        """
+        if not self.or_api_key:
+            raise RuntimeError("OpenRouter API key not configured")
+
+        # Convert Gemini parts to OpenRouter message content
+        content = [{"type": "text", "text": system_prompt}]
+        for part in user_parts:
+            if "text" in part:
+                content.append({"type": "text", "text": part["text"]})
+            elif "inline_data" in part:
+                mime = part["inline_data"].get("mime_type", "image/jpeg")
+                b64 = part["inline_data"]["data"]
+                content.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{mime};base64,{b64}"}
+                })
+
+        payload = {
+            "model": self.or_model,
+            "messages": [
+                {"role": "system", "content": "You are a master apparel pattern maker. Return ONLY valid JSON."},
+                {"role": "user", "content": content},
+            ],
+            "max_tokens": config.OPENROUTER_MAX_TOKENS,
+            "temperature": 0.4,
+        }
+        headers = {
+            "Authorization": f"Bearer {self.or_api_key}",
+            "Content-Type": "application/json",
+        }
+
+        last_error = None
+        for attempt in range(3):
+            if attempt > 0:
+                wait = min(5 * (2 ** (attempt - 1)), 20)
+                logger.info(f"OpenRouter retry {attempt+1}/3 — waiting {wait}s...")
+                await asyncio.sleep(wait)
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                resp = await client.post(self.or_base_url, json=payload, headers=headers)
+                if resp.status_code in (429, 502, 503):
+                    logger.warning(f"OpenRouter HTTP {resp.status_code} (attempt {attempt+1}/3): {resp.text[:200]}")
+                    last_error = resp
+                    continue
+                if resp.status_code >= 400:
+                    logger.error(f"OpenRouter HTTP {resp.status_code}: {resp.text[:300]}")
+                    raise RuntimeError(f"OpenRouter error: {resp.status_code}")
+                data = resp.json()
+                choices = data.get("choices", [])
+                if not choices:
+                    raise ValueError("OpenRouter returned no choices.")
+                text = choices[0].get("message", {}).get("content", "")
+                if not text:
+                    raise ValueError("OpenRouter returned empty response.")
+                logger.info(f"✅ OpenRouter extraction succeeded (attempt {attempt+1})")
+                return text
+        if last_error is not None:
+            raise RuntimeError(f"OpenRouter error (HTTP {last_error.status_code}): {last_error.text[:200]}")
+        raise RuntimeError("OpenRouter call failed after retries.")
+
     async def analyze_measurement_sheet(self, image_bytes: bytes, mime_type: str = "image/jpeg") -> dict:
         """Full analysis of a measurement sheet: garment type, style, measurements, pieces."""
         b64_image = base64.b64encode(image_bytes).decode("utf-8")
@@ -218,7 +286,14 @@ class GeminiClient:
 
         # Retry if critical fields come back zero
         for attempt in range(3):
-            content = await self._call(system_prompt, user_parts)
+            try:
+                content = await self._call(system_prompt, user_parts)
+            except RuntimeError as gemini_err:
+                if self.or_api_key:
+                    logger.warning(f"Gemini failed ({str(gemini_err)[:80]}), falling back to OpenRouter...")
+                    content = await self._call_openrouter(system_prompt, user_parts)
+                else:
+                    raise
             raw = content
             content = self._strip_fences(content)
             try:
