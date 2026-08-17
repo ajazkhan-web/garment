@@ -126,10 +126,17 @@ class GeminiClient:
         self.or_api_key = config.OPENROUTER_API_KEY
         self.or_model = config.OPENROUTER_MODEL
         self.or_base_url = "https://openrouter.ai/api/v1/chat/completions"
-        has_fallback = bool(self.or_api_key)
-        logger.info(f"AI Provider: Google Gemini {'+ OpenRouter fallback' if has_fallback else '(no fallback)'}")
+        self.hf_api_key = config.HF_API_KEY
+        self.hf_model = config.HF_MODEL
+        self.hf_base_url = "https://router.huggingface.co/v1/chat/completions"
+        fallbacks = []
+        if self.or_api_key: fallbacks.append("OpenRouter")
+        if self.hf_api_key: fallbacks.append("HuggingFace")
+        fb_str = " + ".join(fallbacks) if fallbacks else "none"
+        logger.info(f"AI Provider: Google Gemini + {fb_str}")
         logger.info(f"   Gemini:  {self.model}")
-        logger.info(f"   OR:      {self.or_model}" if has_fallback else "   OR:      (not configured)")
+        if self.or_api_key: logger.info(f"   OR:      {self.or_model}")
+        if self.hf_api_key: logger.info(f"   HF:      {self.hf_model}")
         logger.info(f"   API Key: {self.api_key[:15]}...{self.api_key[-4:]}")
 
     def _strip_fences(self, text: str) -> str:
@@ -298,6 +305,60 @@ class GeminiClient:
             raise RuntimeError(f"OpenRouter error (HTTP {last_error.status_code}): {last_error.text[:200]}")
         raise RuntimeError("OpenRouter call failed after retries.")
 
+    async def _call_huggingface(self, system_prompt: str, user_parts: list) -> str:
+        """Third-tier fallback: Hugging Face Inference Router with vision support."""
+        if not self.hf_api_key:
+            raise RuntimeError("HF API key not configured")
+
+        content = [{"type": "text", "text": system_prompt}]
+        for part in user_parts:
+            if "text" in part:
+                content.append({"type": "text", "text": part["text"]})
+            elif "inline_data" in part:
+                mime = part["inline_data"].get("mime_type", "image/jpeg")
+                b64 = part["inline_data"]["data"]
+                content.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{mime};base64,{b64}"}
+                })
+
+        payload = {
+            "model": self.hf_model,
+            "messages": [
+                {"role": "system", "content": "You are a master apparel pattern maker. Return ONLY valid JSON."},
+                {"role": "user", "content": content},
+            ],
+            "max_tokens": config.HF_MAX_TOKENS,
+            "temperature": 0.4,
+        }
+        headers = {
+            "Authorization": f"Bearer {self.hf_api_key}",
+            "Content-Type": "application/json",
+        }
+
+        last_error = None
+        for attempt in range(2):
+            if attempt > 0:
+                await asyncio.sleep(3)
+                logger.info(f"HF retry {attempt+1}/2...")
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                resp = await client.post(self.hf_base_url, json=payload, headers=headers)
+                if resp.status_code == 200:
+                    text = resp.json()["choices"][0]["message"]["content"]
+                    if not text:
+                        raise ValueError("HF returned empty response.")
+                    logger.info(f"✅ HuggingFace extraction succeeded (attempt {attempt+1})")
+                    return text
+                if resp.status_code in (429, 502, 503, 504):
+                    logger.warning(f"HF HTTP {resp.status_code} (attempt {attempt+1}/2): {resp.text[:200]}")
+                    last_error = resp
+                    continue
+                logger.error(f"HF HTTP {resp.status_code}: {resp.text[:300]}")
+                raise RuntimeError(f"HF error: {resp.status_code}")
+        if last_error:
+            raise RuntimeError(f"HF {last_error.status_code}")
+        raise RuntimeError("HF call failed")
+
     async def analyze_measurement_sheet(self, image_bytes: bytes, mime_type: str = "image/jpeg") -> dict:
         """Full analysis of a measurement sheet: garment type, style, measurements, pieces."""
         b64_image = base64.b64encode(image_bytes).decode("utf-8")
@@ -315,25 +376,43 @@ class GeminiClient:
         ]
 
         # Retry if critical fields come back zero
-        gemini_failed = False  # track so we don't waste time retrying a dead Gemini
+        gemini_failed = False
+        provider_used = None  # track which provider succeeded
         for attempt in range(3):
             content = None
             if not gemini_failed:
                 try:
                     content = await self._call(system_prompt, user_parts)
+                    provider_used = "gemini"
                 except Exception as gemini_err:
                     logger.warning(f"Gemini failed ({str(gemini_err)[:100]})")
                     gemini_failed = True
-                    if not self.or_api_key:
-                        logger.error("No OpenRouter fallback key configured!")
-                        raise RuntimeError(
-                            "Gemini API unavailable (quota exhausted) and no OpenRouter fallback configured. "
-                            "Set OPENROUTER_API_KEY on Render."
-                        )
+
             if content is None:
-                # Gemini failed or already failed on a previous attempt — use OpenRouter
-                logger.warning(f"Falling back to OpenRouter (attempt {attempt+1})...")
-                content = await self._call_openrouter(system_prompt, user_parts)
+                # Try OpenRouter, then HuggingFace
+                providers = []
+                if self.or_api_key:
+                    providers.append(("OpenRouter", self._call_openrouter))
+                if self.hf_api_key:
+                    providers.append(("HuggingFace", self._call_huggingface))
+
+                if not providers:
+                    raise RuntimeError(
+                        "All AI providers unavailable. Set OPENROUTER_API_KEY or HF_API_KEY."
+                    )
+
+                for pname, pcall in providers:
+                    try:
+                        logger.warning(f"Falling back to {pname} (attempt {attempt+1})...")
+                        content = await pcall(system_prompt, user_parts)
+                        provider_used = pname.lower()
+                        break
+                    except Exception as perr:
+                        logger.warning(f"{pname} failed: {str(perr)[:100]}")
+                        continue
+
+                if content is None:
+                    raise RuntimeError("All AI providers (Gemini + OpenRouter + HF) failed")
             raw = content
             content = self._strip_fences(content)
             try:
